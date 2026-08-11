@@ -1,0 +1,46 @@
+{
+  "name": "adaptive-claude-review-pi-extension",
+  "version": "0.1.1",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "A Pi extension that runs bounded, read-only Claude reviews for selected coding and product-artifact changes.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NOWArocks/adaptive-claude-review.git"
+  },
+  "homepage": "https://github.com/NOWArocks/adaptive-claude-review#readme",
+  "bugs": {
+    "url": "https://github.com/NOWArocks/adaptive-claude-review/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "code-review",
+    "claude"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "bun build ./index.ts --target=node --packages=external --minify --outfile=dist/adaptive-claude-review.js",
+    "verify": "bun run test && bun run typecheck && bun run build"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/bun": "1.2.19",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3"
+  }
+}

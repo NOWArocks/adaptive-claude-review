@@ -1,0 +1,57 @@
+{
+  "enabled": false,
+  "allowedRoots": [
+    "/absolute/path/to/projects"
+  ],
+  "claudeCommand": "claude",
+  "model": "opus",
+  "effort": "medium",
+  "maxAutomaticReviewsPerTask": 2,
+  "maxManualReviewsPerTask": 3,
+  "maxConsecutiveFailures": 2,
+  "maxTaskContextPrompts": 6,
+  "timeoutMs": 90000,
+  "bundleTimeoutMs": 30000,
+  "blockingSeverities": [
+    "Critical",
+    "High"
+  ],
+  "showOutboundNotice": true,
+  "reviewDocumentation": true,
+  "relatedContextFiles": [
+    "README.md",
+    "AGENTS.md",
+    "docs/DECISIONS.md"
+  ],
+  "topicDirectory": "topics",
+  "discoverTopicContext": false,
+  "productArtifactPrefixes": [
+    "topics",
+    "tickets"
+  ],
+  "sensitiveDataPrefixes": [
+    "src/customer-data"
+  ],
+  "deniedPaths": [
+    "private",
+    "data/raw-exports"
+  ],
+  "sharedReviewPaths": [
+    "topics/OPEN.md"
+  ],
+  "reviewPriorities": [
+    "Check correctness, gaps, and completeness against the stated task before considering secondary improvements.",
+    "Check consistency with existing decisions, scope, terminology, and related artifacts. Say Unknown when context is insufficient.",
+    "Respect source provenance. Do not turn missing source access into an absence claim.",
+    "Require explicit current-turn authorization for shared-system writes.",
+    "Check realistic workflows, failure handling, security-sensitive paths, and material tests."
+  ],
+  "reviewProfiles": {
+    "figjam": [
+      "Check the final board outcome, not only source code or payload generation.",
+      "Check source and status labels, terminology, hierarchy, decisions, open questions, and next actions.",
+      "Require distinct evidence for payload generation and import or rendering.",
+      "If no rendered image was inspected, keep visual quality Unknown."
+    ]
+  }
+}
