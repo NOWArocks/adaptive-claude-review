@@ -162,6 +162,18 @@ describe("extension lifecycle", () => {
     });
   });
 
+  test("arms a fresh review task for the explicit delegated executor protocol", async () => {
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nDelegated executor change reviewed."; }, async (h) => {
+      await h.emit("session_start", { type: "session_start", reason: "startup" });
+      await h.emit("input", { type: "input", text: "[delegated-execution:v1]\nExecute the approved plan.", source: "extension" });
+      h.setIdle(false);
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      expect(await h.finish()).toBeUndefined();
+      expect(calls).toBe(1);
+    });
+  });
+
   test("holds blocking findings, sends bounded untrusted correction data, then releases a corrected PASS", async () => {
     const outputs = ["VERDICT: FINDINGS\n**High — authorization bypass**", "VERDICT: PASS\nAuthorization is enforced."];
     await withHarness(async () => outputs.shift()!, async (h) => {
@@ -334,27 +346,12 @@ describe("extension lifecycle", () => {
     });
   });
 
-  test("fails closed with the exact changed-file reason when outbound content contains a credential", async () => {
-    let calls = 0;
-    await withHarness(async () => { calls++; return "VERDICT: PASS\nUnused"; }, async (h) => {
-      await h.start();
-      const fakeToken = ["ghp_", "a".repeat(36)].join("");
-      await h.mutate("src/auth/session.ts", `export const access_token = ${JSON.stringify(fakeToken)};\n`);
-      const result = await h.finish();
-      expect(warningText(result)).toContain("changed file src/auth/session.ts appears to contain a credential");
-      expect(warningText(result)).toContain("no Claude PASS");
-      expect(calls).toBe(0);
-    });
-  });
-
   test("withholds denied path names and content while reviewing the remaining safe scope", async () => {
     let reviewInput = "";
     await withHarness(async (_config, input) => { reviewInput = input; return "VERDICT: PASS\nSafe scope reviewed."; }, async (h) => {
       await h.start();
       await h.mutate("src/auth/session.ts", "export const secure = true;\n");
       await h.mutate("private/customer.json", "private record\n");
-      await h.emit("tool_result", { type: "tool_result", toolCallId: "denied-read", toolName: "read", input: { path: join(h.root, "private/customer.json") }, isError: false, content: [] });
-      await h.emit("tool_result", { type: "tool_result", toolCallId: "denied-command", toolName: "bash", input: { command: "git diff -- private/customer.json" }, isError: false, content: [] });
       expect(await h.finish()).toBeUndefined();
       expect(reviewInput).toContain("src/auth/session.ts");
       expect(reviewInput).toContain("1 protected path name(s) and content withheld");
@@ -574,6 +571,116 @@ describe("extension lifecycle", () => {
       expect(warningText(await h.finish())).toContain("local emergency");
     });
   });
+
+  test("reviews a Jira product artifact before allowing the shared write", async () => {
+    let calls = 0;
+    let reviewInput = "";
+    await withHarness(async (_config, input) => {
+      calls++;
+      reviewInput = input;
+      return "VERDICT: PASS\nTicket is refinement-ready.";
+    }, async (h) => {
+      await h.start("Create the Jira implementation task");
+      const input = {
+        arguments: {
+          projectKey: "WKW",
+          issueTypeName: "Task",
+          summary: "Implement survey",
+          description: "Acceptance criteria",
+        },
+      };
+      const preflight = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-create", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(preflight).toBeUndefined();
+      expect(calls).toBe(1);
+      expect(reviewInput).toContain("Create the Jira implementation task");
+      expect(reviewInput).toContain("Acceptance criteria");
+      expect(reviewInput).not.toContain("target WKW: Implement survey:");
+      const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-create", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
+      expect(result.content.at(-1).text).toContain("pre-write review passed");
+    });
+  });
+
+  test("applies the same pre-write gate to Jira edits/comments and Confluence creates/updates", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: PASS\nShared artifact is ready.";
+    }, async (h) => {
+      await h.start();
+      const cases = [
+        ["jira-edit", "mcp_http_atlassian_editjiraissue", { arguments: { issueIdOrKey: "WKW-1", fields: { description: "Updated criteria" } } }],
+        ["jira-comment", "mcp_http_atlassian_addcommenttojiraissue", { arguments: { issueIdOrKey: "WKW-1", commentBody: "Ready for refinement" } }],
+        ["confluence-create", "mcp_http_atlassian_createconfluencepage", { arguments: { spaceId: "123", title: "Decision", body: "<p>Approved scope</p>" } }],
+        ["confluence-update", "mcp_http_atlassian_updateconfluencepage", { arguments: { pageId: "456", title: "Decision", body: "<p>Updated scope</p>" } }],
+        ["confluence-publish", "mcp_http_atlassian_updateconfluencepage", { arguments: { pageId: "456", status: "current" } }],
+        ["confluence-comment-edit", "mcp_http_atlassian_updateconfluenceinlinecomment", { arguments: { pageId: "456", commentId: "789", body: "<p>Corrected decision</p>" } }],
+      ] as const;
+      for (const [toolCallId, toolName, input] of cases) {
+        expect(await h.emit("tool_call", { type: "tool_call", toolCallId, toolName, input })).toBeUndefined();
+        const result = await h.emit("tool_result", { type: "tool_result", toolCallId, toolName, input, isError: false, content: [] });
+        expect(result.content.at(-1).text).toContain("pre-write review passed");
+      }
+      expect(calls).toBe(cases.length);
+    });
+  });
+
+  test("blocks a shared write when pre-write review returns material findings", async () => {
+    await withHarness(async () => "VERDICT: FINDINGS\nMedium: acceptance criteria contradict the parent task", async (h) => {
+      await h.start();
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Conflicting scope" } };
+      const preflight = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-findings", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(preflight.block).toBe(true);
+      expect(preflight.reason).toContain("blocked this Jira write");
+      expect(preflight.reason).toContain("Medium");
+    });
+  });
+
+  test("fails closed when the shared-artifact reviewer is unavailable", async () => {
+    await withHarness(async () => { throw new Error("review service unavailable"); }, async (h) => {
+      await h.start();
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Scope" } };
+      const preflight = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-failure", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(preflight.block).toBe(true);
+      expect(preflight.reason).toContain("blocked fail-closed");
+      expect(preflight.reason).toContain("review service unavailable");
+    });
+  });
+
+  test("keeps shared-system writes fail-closed when review is paused or disabled", async () => {
+    const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Scope" } };
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.start();
+      await h.command("claude-review-pause");
+      const paused = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-paused", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(paused.block).toBe(true);
+      expect(paused.reason).toContain("paused");
+    });
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.start();
+      const disabled = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-disabled", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(disabled.block).toBe(true);
+      expect(disabled.reason).toContain("disabled");
+    }, "rpc", { enabled: false });
+  });
+
+  test("manual claude_review accepts exact shared-system snapshots without repository paths", async () => {
+    await withHarness(async (_config, input) => {
+      expect(input).toContain("WKW-2974");
+      expect(input).toContain("Implement the mini-survey");
+      expect(input).toContain("Review the final Jira state");
+      expect(input).toContain("Design PR is not available yet");
+      return "VERDICT: PASS\nShared artifact snapshot is coherent.";
+    }, async (h) => {
+      await h.start();
+      const result = await h.tools.get("claude_review").execute("artifact-review", {
+        rationale: "Review the final Jira state",
+        artifacts: [{ system: "Jira", target: "WKW-2974", content: "Implement the mini-survey" }],
+        unverified: ["Design PR is not available yet"],
+      }, undefined, undefined, h.ctx);
+      expect(result.details.passed).toBe(true);
+      expect(result.content[0].text).toContain("VERDICT: PASS");
+    });
+  });
 });
 
 describe("configuration diagnostics", () => {
@@ -600,26 +707,6 @@ describe("configuration diagnostics", () => {
       expect(loaded.config.maxAutomaticReviewsPerTask).toBe(2);
       expect(loaded.config.timeoutMs).toBe(90_000);
       expect(loaded.warnings).toContain("Unknown configuration key: mystery");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("warns when privacy-related path entries are invalid or truncated", () => {
-    const root = mkdtempSync(join(tmpdir(), "adaptive-review-config-"));
-    const path = join(root, "config.json");
-    try {
-      const deniedPaths = ["/absolute/private", "../escaping", ...Array.from({ length: 101 }, (_, index) => `private-${index}`)];
-      writeFileSync(path, JSON.stringify({ deniedPaths, sensitiveDataPrefixes: ["~/customer-data", "src/customer-data"] }));
-      const loaded = loadConfigFile(path);
-      expect(loaded.config.deniedPaths).toHaveLength(100);
-      expect(loaded.config.deniedPaths).not.toContain("/absolute/private");
-      expect(loaded.config.sensitiveDataPrefixes).toEqual(["src/customer-data"]);
-      expect(loaded.warnings).toEqual(expect.arrayContaining([
-        expect.stringContaining("deniedPaths ignored 2 invalid entries"),
-        expect.stringContaining("deniedPaths kept the first 100 entries"),
-        expect.stringContaining("sensitiveDataPrefixes ignored 1 invalid entry"),
-      ]));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

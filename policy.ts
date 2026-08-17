@@ -61,7 +61,7 @@ const SOURCE_FILE = /\.(?:c|cc|cpp|cs|go|java|js|jsx|kt|kts|m|mm|php|py|rb|rs|sc
 const REVIEW_TEXT_FILE = /(?:^|\/)(?:Dockerfile|Makefile|Procfile|[^/]+\.(?:c|cc|conf|config|cpp|cs|css|csv|env\.example|go|graphql|gql|h|hpp|html|ini|java|js|json|jsonl|jsx|kt|kts|m|md|mdx|mm|php|properties|py|rb|rs|rst|scala|scss|sh|sql|svelte|swift|tf|toml|ts|tsx|txt|vue|xml|ya?ml))$/i;
 const FIGJAM_PATH = /(?:^|\/)figjam(?:\/|[-_.])/i;
 const IMAGE_PATH = /\.(?:avif|bmp|gif|heic|jpe?g|png|svg|webp)$/i;
-const CHECK_COMMAND = /(?:\b(?:bun\s+(?:run\s+)?(?:test|build|lint|typecheck|verify)|npm\s+(?:run\s+)?(?:test|build|lint|typecheck|verify)|pnpm\s+(?:run\s+)?(?:test|build|lint|typecheck|verify)|yarn\s+(?:run\s+)?(?:test|build|lint|typecheck|verify)|pytest|python(?:3)?\s+-m\s+pytest|go\s+test|cargo\s+test|bundle\s+exec\s+rspec|php\s+artisan\s+test|xcodebuild\b.*\b(?:test|build)|flutter\s+test|gradlew\s+(?:test|build)|tsc|eslint|playwright|appium)\b|(?:^|[\s;&|])\.\/verify\b)/i;
+const CHECK_COMMAND = /(?:\b(?:bun\s+(?:run\s+)?(?:test|build|lint|typecheck|verify)|npm\s+(?:--prefix\s+\S+\s+)?(?:run\s+)?(?:test|build|lint|typecheck|verify)|pnpm\s+(?:run\s+)?(?:test|build|lint|typecheck|verify)|yarn\s+(?:run\s+)?(?:test|build|lint|typecheck|verify)|pytest|python(?:3)?\s+-m\s+pytest|go\s+test|cargo\s+test|bundle\s+exec\s+rspec|php\s+artisan\s+test|xcodebuild\b.*\b(?:test|build)|flutter\s+test|gradlew\s+(?:test|build)|tsc|eslint|playwright|appium)\b|(?:^|[\s;&|])\.\/verify\b)/i;
 const NON_EXECUTING_CHECK = /(?:^|\s)--(?:help|version|dry-run|list|list-tests|collect-only|no-run)\b|(?:^|\s)-(?:h|V)\b/i;
 const MASKED_CHECK_RESULT = /\|\||(?:^|[;&]\s*)(?:true|exit\s+0)(?:\s|$)|\|(?!\|)/;
 const SENSITIVE_COMMAND = /(?:^|[\s;&|])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+|\b(?:api[_-]?key|authorization|credential|password|passwd|secret|token)\b\s*(?:=|:|\s)\s*["']?\S+|(?:^|\s)-u\s+\S+:\S+|https?:\/\/[^/\s:@]+:[^@\s/]+@/i;
@@ -292,6 +292,11 @@ export function findTopicRoots(paths: string[], topicDirectory: string): string[
 
 export function startsNewReviewTask(source: string, hostIsIdle: boolean): boolean {
   return source !== "extension" && hostIsIdle;
+}
+
+/** Opt-in protocol for delegated executor extensions. Other extension messages remain non-task context. */
+export function isDelegatedExecutionInput(text: string): boolean {
+  return text.trimStart().startsWith("[delegated-execution:v1]");
 }
 
 export function shouldRetainTaskPrompt(prompt: string): boolean {

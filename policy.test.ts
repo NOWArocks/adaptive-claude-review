@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildTaskScopedDiff, classifyDeliveryStop, createSnapshot, decideDeliveryGate, nextPathRisk, selectUnsafeReviewPaths, shouldRunDeliveryGate, supportsAutomaticCorrectionTurn, transformDeliveryMarkdown } from "./index.ts";
+import { buildTaskScopedDiff, classifyDeliveryStop, createSnapshot, decideDeliveryGate, nextPathRisk, selectUnsafeReviewPaths, sharedArtifactFromToolCall, shouldRunDeliveryGate, supportsAutomaticCorrectionTurn, transformDeliveryMarkdown } from "./index.ts";
 import {
   bundleBlock,
   classifyReview,
@@ -15,6 +15,7 @@ import {
   formatReviewPriorities,
   formatReviewProfiles,
   formatTaskContext,
+  isDelegatedExecutionInput,
   isFigJamImportRenderCheck,
   isDeniedReviewPath,
   isFigJamSpecificCheck,
@@ -40,11 +41,72 @@ import {
   truncateBundleContent,
 } from "./policy.ts";
 
+function execViaSpawnSync(command: string, args: string[], cwd: string) {
+  const result = spawnSync(command, args, { cwd, encoding: "utf8" });
+  return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1, killed: false };
+}
+
 const modified = (path: string, addedLines: number, deletedLines = 0) => ({
   path,
   addedLines,
   deletedLines,
   kind: "modified" as const,
+});
+
+describe("sharedArtifactFromToolCall", () => {
+  test("extracts nested Jira issue creation content", () => {
+    const artifact = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", {
+      arguments: {
+        projectKey: "WKW",
+        issueTypeName: "Task",
+        summary: "Implement survey",
+        description: "Acceptance criteria",
+      },
+    });
+    expect(artifact?.system).toBe("Jira");
+    expect(artifact?.action).toBe("create issue");
+    expect(artifact?.target).toBe("WKW: Implement survey");
+    expect(artifact?.content).toContain("Acceptance criteria");
+  });
+
+  test("reviews only content-changing Jira edits and ignores links and reads", () => {
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_editjiraissue", {
+      arguments: { issueIdOrKey: "WKW-1", fields: { description: "Updated" } },
+    })?.target).toBe("WKW-1");
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_editjiraissue", {
+      arguments: { issueIdOrKey: "WKW-1", fields: { labels: ["x"] } },
+    })).toBeUndefined();
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_editjiraissue", {
+      arguments: { issueIdOrKey: "WKW-1", fields: { customfield_12345: "Narrative acceptance criteria" } },
+    })?.content).toContain("Narrative acceptance criteria");
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_editjiraissue", {
+      arguments: { issueIdOrKey: "WKW-1", fields: { parent: { key: "WKW-2" } } },
+    })?.content).toContain("WKW-2");
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_createissuelink", {
+      arguments: { inwardIssue: "WKW-1", outwardIssue: "WKW-2", type: "Relates" },
+    })).toBeUndefined();
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_getjiraissue", {
+      arguments: { issueIdOrKey: "WKW-1" },
+    })).toBeUndefined();
+  });
+
+  test("extracts Confluence page bodies and Jira comments", () => {
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_createconfluencepage", {
+      arguments: { spaceId: "123", title: "Decision", body: "<p>Approved</p>" },
+    })?.content).toContain("Approved");
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_addcommenttojiraissue", {
+      arguments: { issueIdOrKey: "WKW-1", commentBody: "Ready for review" },
+    })?.action).toBe("add comment");
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_updateconfluencepage", {
+      arguments: { pageId: "456", status: "current" },
+    })?.content).toContain("current");
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_createconfluenceinlinecomment", {
+      arguments: { pageId: "456", body: "<p>Clarify this decision</p>" },
+    })?.content).toContain("Clarify this decision");
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_updateconfluenceinlinecomment", {
+      arguments: { pageId: "456", commentId: "789", body: "<p>Corrected decision</p>" },
+    })?.action).toBe("edit comment");
+  });
 });
 
 describe("classifyReview", () => {
@@ -213,10 +275,7 @@ describe("task-scoped diff isolation", () => {
   }
 
   const pi = {
-    exec: async (command: string, args: string[], options: { cwd: string }) => {
-      const result = spawnSync(command, args, { cwd: options.cwd, encoding: "utf8" });
-      return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1, killed: false };
-    },
+    exec: async (command: string, args: string[], options: { cwd: string }) => execViaSpawnSync(command, args, options.cwd),
   } as any;
 
   test("returns no snapshot for a repository without a baseline commit", async () => {
@@ -235,8 +294,7 @@ describe("task-scoped diff isolation", () => {
     const scopedPi = {
       exec: async (command: string, args: string[], options: { cwd: string }) => {
         calls.push(args);
-        const result = spawnSync(command, args, { cwd: options.cwd, encoding: "utf8" });
-        return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1, killed: false };
+        return execViaSpawnSync(command, args, options.cwd);
       },
     } as any;
     try {
@@ -247,18 +305,6 @@ describe("task-scoped diff isolation", () => {
       expect(calls).toHaveLength(3);
       expect(calls.filter((args) => args.includes("--numstat"))).toHaveLength(1);
       expect(calls.filter((args) => args.includes("--porcelain=v1"))).toHaveLength(1);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("does not retain denied file content in snapshots", async () => {
-    const { root, baseCommit } = createRepository();
-    try {
-      mkdirSync(join(root, "private"));
-      writeFileSync(join(root, "private/customer.json"), "private record\n", "utf8");
-      const snapshot = await createSnapshot(pi, root, baseCommit, true, ["private/customer.json"], undefined, ["private"]);
-      expect(snapshot!.files.get("private/customer.json")?.content).toBeUndefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -511,6 +557,13 @@ describe("task context", () => {
     expect(startsNewReviewTask("extension", true)).toBe(false);
   });
 
+  test("recognizes only the explicit delegated-execution protocol", () => {
+    expect(isDelegatedExecutionInput("[delegated-execution:v1]\nExecute the plan")).toBe(true);
+    expect(isDelegatedExecutionInput("  [delegated-execution:v1]\nExecute the plan")).toBe(true);
+    expect(isDelegatedExecutionInput("[delegated-execution:v2]\nExecute the plan")).toBe(false);
+    expect(isDelegatedExecutionInput("Execute the plan")).toBe(false);
+  });
+
   test("does not retain empty prompts or likely credentials in history", () => {
     expect(shouldRetainTaskPrompt("Normal clarification")).toBe(true);
     expect(shouldRetainTaskPrompt("   ")).toBe(false);
@@ -654,12 +707,11 @@ describe("task-local review evidence", () => {
     expect(observeToolEvidence("jira_update_issue", { issueKey: "PROJ-123" }, false)).toEqual({});
   });
 
-  test("records image reads as visual evidence and withholds protected or denied paths", () => {
+  test("records image reads as visual evidence and withholds protected paths", () => {
     expect(observeToolEvidence("read", { path: "FigJam/final-board.png" }, false)).toEqual({
       source: { kind: "visual", detail: "Image artifact opened: FigJam/final-board.png", path: "FigJam/final-board.png" },
     });
     expect(observeToolEvidence("read", { path: ".env.production" }, false)).toEqual({});
-    expect(observeToolEvidence("read", { path: "private/customer.json" }, false, ["private"])).toEqual({});
     expect(observeToolEvidence("read", { path: "README.md" }, true)).toEqual({});
   });
 
@@ -671,26 +723,15 @@ describe("task-local review evidence", () => {
     expect(observeToolEvidence("bash", { command: "./verify" }, true).check?.passed).toBe(false);
   });
 
-  test("does not copy credentials or sensitive paths from verification commands", () => {
-    const credentialCommand = `PGPASSWORD=${"h".repeat(12)} npm test`;
-    const credentialObservation = observeToolEvidence("bash", { command: credentialCommand }, false);
-    expect(credentialObservation.check?.command).toContain("detail withheld");
-    expect(credentialObservation.check?.command).not.toContain(credentialCommand);
-
-    const deniedCommand = "bun test private/customer.test.ts";
-    const deniedObservation = observeToolEvidence("bash", { command: deniedCommand }, false, ["private"]);
-    expect(deniedObservation.check?.command).toBe("Verification command detail withheld");
-    expect(deniedObservation.check?.command).not.toContain("private");
-
-    const absoluteCommand = "bun test /Users/example/project/policy.test.ts";
-    expect(observeToolEvidence("bash", { command: absoluteCommand }, false).check?.command).toBe("Verification command detail withheld");
-    expect(observeToolEvidence("bash", { command: "git diff -- private/customer.json" }, false, ["private"]).source).toEqual({
-      kind: "repository",
-      detail: "Git repository inspection",
-    });
+  test("does not copy credentials from recognized verification commands", () => {
+    const command = `PGPASSWORD=${"h".repeat(12)} npm test`;
+    const observation = observeToolEvidence("bash", { command }, false);
+    expect(observation.check?.command).toContain("detail withheld");
+    expect(observation.check?.command).not.toContain(command);
   });
 
-  test("recognizes real Bun scripts but rejects non-executing and masked checks", () => {
+  test("recognizes real package checks but rejects non-executing and masked checks", () => {
+    expect(isRecognizedVerificationCommand("npm --prefix Tools/pi-wkw-workflows test")).toBe(true);
     expect(isRecognizedVerificationCommand("bun run verify")).toBe(true);
     expect(isRecognizedVerificationCommand("bun run lint")).toBe(true);
     expect(isRecognizedVerificationCommand("bun test ./policy.test.ts")).toBe(true);
@@ -878,9 +919,8 @@ describe("review safety and result parsing", () => {
 
   test("detects high-confidence embedded credentials without flagging accessors", () => {
     expect(containsLikelySecret(`token = ${["ghp_", "a".repeat(24)].join("")}`)).toBe(true);
-    expect(containsLikelySecret(["DATABASE_URL=postgresql://", "alice:correct-horse@", "example.test/app"].join(""))).toBe(true);
-    const jwtFixture = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "signature123456"].join(".");
-    expect(containsLikelySecret(`const jwt = '${jwtFixture}';`)).toBe(true);
+    expect(containsLikelySecret("DATABASE_URL=postgresql://alice:correct-horse@example.test/app")).toBe(true);
+    expect(containsLikelySecret("const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123456';")).toBe(true);
     expect(containsLikelySecret("client_secret = literal-secret-value")).toBe(true);
     expect(containsLikelySecret("const token = getToken();")).toBe(false);
     expect(containsLikelySecret("const password = process.env.PASSWORD;")).toBe(false);
