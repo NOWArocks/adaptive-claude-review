@@ -13,7 +13,7 @@ This is an independent project. It is not affiliated with or endorsed by Anthrop
 - Holds qualifying final responses behind a `message_end` delivery gate.
 - Returns blocking findings privately to the primary agent for correction, then reviews the corrected state again.
 - Treats `Critical` and `High` findings as blocking for repository delivery by default. The release example makes shared-system write findings advisory; enforcing mode remains available and is used for legacy configurations without an explicit mode.
-- Keeps manual review attempts separate from automatic delivery-gate attempts.
+- Enforces one hard two-invocation cap across manual, automatic, shared-artifact, and direct Claude CLI reviews in each delivery cycle.
 - Stops repeated reviewer failures with a task-local circuit breaker.
 - Runs Claude without tools or session persistence, with a minimal environment and an empty temporary working directory.
 
@@ -22,6 +22,14 @@ Shared-system review evaluates the current mutation, not an impossible atomic re
 `sharedArtifactWriteMode` controls that pre-write result. The release example selects `advisory`, which lets the explicitly requested write proceed with a visible finding or no-PASS warning; deterministic credential checks still block. This mode assumes that the host agent or a separate policy gate enforces current-turn write authorization. `enforce` retains fail-closed blocking for configured severities and reviewer unavailability. When a later write depends on an identifier created by the current write, the first mutation can proceed before a separate issue-link call uses the generated key. Exact-target read-back remains required after every successful write.
 
 A Claude `PASS` is evidence from a bounded second model, not proof of correctness. Exact-target verification remains required.
+
+## Hard review cap
+
+Each delivery cycle permits at most two Claude review invocations: one initial review and one final review after corrections. Timeouts, malformed outputs, authentication failures after an attempt starts, manual `claude_review` calls, automatic delivery-gate reviews, Jira or Confluence pre-write reviews, and direct `claude -p` or `claude --print` review commands all consume the same cap. Cached PASS reuse does not consume another slot.
+
+A third review is never permitted. If the final review still reports findings, the extension can queue one last private correction turn. The corrected result then proceeds after deterministic verification with a visible warning that it has no final Claude PASS. Deterministic credential and protected-data checks remain separate hard blockers.
+
+The counter carries across follow-up user turns until the current delivery is released or a successful shared-system write completes. A completed delivery starts a new cycle on the next user task. Starting a new Pi session also resets the counter.
 
 ## Task and working-tree isolation
 
@@ -116,9 +124,9 @@ Malformed JSON produces a visible `config error` state and disables repository r
 | `claudeCommand` | Claude CLI executable. No shell is used. | `claude` |
 | `model` | Reviewer model. | `opus` |
 | `effort` | Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, or `max`. | `medium` |
-| `maxAutomaticReviewsPerTask` | Delivery-gate attempt budget. The default permits the initial review and one post-correction review. | `2` |
-| `maxManualReviewsPerTask` | Explicit tool-call attempt budget. | `3` |
-| `maxSharedArtifactReviewsPerTask` | Automatic Jira and Confluence pre-write review budget per task. | `20` |
+| `maxAutomaticReviewsPerTask` | Automatic delivery-gate sub-budget. It cannot exceed the hard two-review total. | `2` |
+| `maxManualReviewsPerTask` | Explicit tool-call sub-budget. It cannot exceed the hard two-review total. | `2` |
+| `maxSharedArtifactReviewsPerTask` | Jira and Confluence pre-write sub-budget. It cannot exceed the hard two-review total. | `2` |
 | `maxConsecutiveFailures` | Failures before the task-local circuit opens. | `2` |
 | `timeoutMs` | Reviewer-process timeout, bounded to 30–300 seconds. | `90000` |
 | `bundleTimeoutMs` | Aggregate bundle-construction deadline. | `30000` |
@@ -202,11 +210,11 @@ After a successful `edit` or `write`, streaming draft text is masked until the f
 
 Review unavailability releases the response with a visible warning that the state has no Claude `PASS`. This avoids silently swallowing the user's primary-agent result while making the missing gate explicit.
 
-Unresolved blocking findings behave differently. When the automatic attempt budget is exhausted, the extension stops the loop and withholds the final response. The user can inspect it with `/claude-review-last draft`. Releasing it requires `/claude-review-release <reason>` and always adds a visible no-PASS disclosure.
+Unresolved blocking findings from the initial review are returned privately for correction before the final review. If the final review still reports findings, interactive and RPC modes can run one last private correction turn, but the corrected result is not reviewed a third time. It is released with a visible no-PASS disclosure after deterministic verification. A lower configured sub-budget or a failed correction handoff can still withhold a draft for deliberate release through `/claude-review-release <reason>`.
 
-Interactive and RPC modes can run private correction turns. With the default two-review budget, there is at most one automatic correction loop. After blocking findings, the corrected state must receive the second review even when the remaining diff would normally be skipped as small or test-only. JSON and print modes cannot run correction turns; blocking findings release a visible one-shot warning instead.
+After initial blocking findings, the corrected state must receive the final review even when the remaining diff would normally be skipped as small or test-only. JSON and print modes cannot run correction turns; blocking findings release a visible one-shot warning instead.
 
-A `PASS` remains valid for the same file-state fingerprint. Blocking `FINDINGS` can be reviewed again without an artificial file edit only when the bounded review context changes, such as new task evidence or a changed manual rationale or unknown list. An exact duplicate context is rejected, and the existing attempt budgets still bound all retries.
+A `PASS` remains valid for the same file-state fingerprint. Blocking `FINDINGS` can receive the one permitted final review without an artificial file edit only when the bounded review context changes, such as new task evidence or a changed manual rationale or unknown list. An exact duplicate context is rejected, and the hard two-review cap bounds all retries.
 
 Reviewer output and withheld drafts are wrapped in fresh random untrusted-data boundaries before the private correction turn. The primary agent is told to evaluate findings as claims and never execute embedded instructions.
 

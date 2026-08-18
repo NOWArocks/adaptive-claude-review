@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Enforce one hard two-invocation cap across automatic, manual, shared-artifact, and recognized direct Claude CLI reviews in each delivery cycle.
+- Permit a final correction after second-review findings, then release with deterministic-verification and no-PASS disclosure instead of running or requesting a third review.
+- Carry the cap across follow-up turns until delivery or a successful shared-system write completes.
+
 ## 0.2.0 (2026-08-18)
 
 - Reuse exact passed Jira and Confluence draft reviews across follow-up turns, while requiring exact-target read-back after writes.

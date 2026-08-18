@@ -7,7 +7,7 @@
   "model": "opus",
   "effort": "medium",
   "maxAutomaticReviewsPerTask": 2,
-  "maxManualReviewsPerTask": 3,
+  "maxManualReviewsPerTask": 2,
   "maxConsecutiveFailures": 2,
   "maxTaskContextPrompts": 6,
   "timeoutMs": 90000,
