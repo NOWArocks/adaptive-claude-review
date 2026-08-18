@@ -725,11 +725,41 @@ describe("extension lifecycle", () => {
       expect(reviewInput).toContain("Do not require post-write evidence, a re-fetch");
       expect(reviewInput).toContain("A separate chat draft, manual reply, or other deliverable does not need to be embedded");
       expect(reviewInput).toContain("Do not treat missing automated checks as a finding for a content-only shared-system edit");
+      expect(reviewInput).toContain("Missing source content or a task-boundary reset within this Pi session does not prove that prior research was not done");
+      expect(reviewInput).toContain("Evidence from an unrelated target does not support the current artifact");
+      expect(reviewInput).toContain("without reopening settled product choices merely because their original evidence is not repeated");
       expect(reviewInput).toContain("do not require unchanged text to be rewritten or independently re-proven");
       expect(reviewInput).not.toContain("target WKW: Implement survey:");
       const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-create", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
       expect(result.content.at(-1).text).toContain("pre-write review passed");
       expect(result.content.at(-1).text).toContain("Exact-target read-back verification is still required");
+    });
+  });
+
+  test("retains Jira source evidence across follow-up task boundaries", async () => {
+    let reviewInput = "";
+    await withHarness(async (_config, input) => {
+      reviewInput = input;
+      return "VERDICT: PASS\nFollow-up artifact is supported.";
+    }, async (h) => {
+      await h.start("Review WKW-2687 and draft the tickets");
+      const readInput = { arguments: { issueIdOrKey: "WKW-2687" } };
+      await h.emit("tool_result", {
+        type: "tool_result",
+        toolCallId: "jira-read",
+        toolName: "mcp_http_atlassian_getjiraissue",
+        input: readInput,
+        isError: false,
+        content: [],
+      });
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Create the approved tickets", source: "rpc" });
+      h.setIdle(false);
+
+      const createInput = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Event filters", description: "Approved criteria" } };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-follow-up", toolName: "mcp_http_atlassian_createjiraissue", input: createInput })).toBeUndefined();
+      expect(reviewInput).toContain("Jira issue read: WKW-2687");
     });
   });
 
@@ -784,15 +814,32 @@ describe("extension lifecycle", () => {
     });
   });
 
-  test("blocks a shared write when pre-write review returns material findings", async () => {
-    await withHarness(async () => "VERDICT: FINDINGS\nMedium: acceptance criteria contradict the parent task", async (h) => {
+  test("allows advisory shared-artifact findings but blocks configured severities", async () => {
+    await withHarness(async () => "VERDICT: FINDINGS\nMedium: optional wording improvement", async (h) => {
+      await h.start();
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-advisory", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-advisory", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
+      expect(result.content.at(-1).text).toContain("advisory Medium findings");
+      expect(result.content.at(-1).text).toContain("severity policy allowed the write");
+    });
+
+    await withHarness(async () => "VERDICT: FINDINGS\nHigh: acceptance criteria contradict the parent task", async (h) => {
       await h.start();
       const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Conflicting scope" } };
       const preflight = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-findings", toolName: "mcp_http_atlassian_createjiraissue", input });
       expect(preflight.block).toBe(true);
       expect(preflight.reason).toContain("blocked this Jira write");
-      expect(preflight.reason).toContain("Medium");
+      expect(preflight.reason).toContain("High");
     });
+
+    await withHarness(async () => "VERDICT: FINDINGS\nMedium: configured blocking finding", async (h) => {
+      await h.start();
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Configured policy" } };
+      const preflight = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-configured-medium", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(preflight.block).toBe(true);
+      expect(preflight.reason).toContain("Medium");
+    }, "rpc", { blockingSeverities: ["Critical", "High", "Medium"] });
   });
 
   test("fails closed when the shared-artifact reviewer is unavailable", async () => {

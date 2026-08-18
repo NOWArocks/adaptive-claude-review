@@ -118,6 +118,7 @@ type SharedArtifactReviewResult = {
   output: string;
   verdict: ReviewVerdict;
   inputChars: number;
+  blocking: boolean;
   severities: ReviewSeverity[];
   fingerprint: string;
 };
@@ -776,6 +777,8 @@ Rules:
 - Treat technically dependent shared-system writes as a sequence. Review only the current mutation and do not require a later mutation to be embedded before its target exists. In particular, a Jira create-issue call cannot include a formal issue link through this tool: allow the issue to be created first so a later create-issue-link call can use its generated key. Report a finding only when the current mutation contradicts or prevents the requested follow-up.
 - Review only the proposed shared-system mutation. A separate chat draft, manual reply, or other deliverable does not need to be embedded in the shared-system payload unless the task explicitly requires that destination.
 - Do not treat missing automated checks as a finding for a content-only shared-system edit. Assess whether the proposed content is supported by the supplied task and evidence.
+- The evidence ledger is bounded metadata, not a transcript. Missing source content or a task-boundary reset within this Pi session does not prove that prior research was not done. Evidence from an unrelated target does not support the current artifact. Raise a provenance finding only for a contradiction, an explicit Unknown, or a safety-critical claim that requires direct evidence.
+- Follow-up requests can approve or refine artifacts drafted in earlier turns. When the user explicitly asks to write an iteratively reviewed artifact, check execution fidelity and material contradictions without reopening settled product choices merely because their original evidence is not repeated in the current turn.
 - When the task requests a narrow edit to an existing artifact, do not require unchanged text to be rewritten or independently re-proven unless the narrow edit introduces a contradiction or material risk.
 - This review does not authorize the shared-system write.
 - If there are no material findings, return exactly "VERDICT: PASS" followed by one short explanation.
@@ -1284,6 +1287,7 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
     let config = loaded.config;
     let task = createTaskState(0);
     let humanPromptHistory: string[] = [];
+    let sessionEvidence = createTaskEvidenceLedger(50);
     let activeSessionId: string | undefined;
     let claudeAuthenticated = false;
     let paused = false;
@@ -1294,7 +1298,7 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
       latenciesMs: [],
     };
     let outboundNoticeShown = false;
-    const approvedSharedWrites = new Map<string, { artifact: SharedArtifactCandidate; taskGeneration: number }>();
+    const approvedSharedWrites = new Map<string, { artifact: SharedArtifactCandidate; review: SharedArtifactReviewResult; taskGeneration: number }>();
 
     pi.registerMarkdownTransformer((markdown, context) => transformDeliveryMarkdown(markdown, context, task.deliveryDraftHidden || task.correctionPending));
 
@@ -1618,9 +1622,9 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
           owner.approvedSharedArtifacts,
           owner.prompt,
           config.reviewPriorities,
-          owner.evidence.sources(),
-          owner.evidence.checks(),
-          owner.evidence.observed(),
+          sessionEvidence.sources(),
+          sessionEvidence.checks(),
+          sessionEvidence.observed(),
           rationale,
           unverified,
         );
@@ -1635,11 +1639,14 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
         if (containsLikelySecret(output)) throw new Error("Claude reviewer output was withheld because it appears to contain a credential.");
         const verdict = parseReviewVerdict(output);
         if (verdict === "unknown") throw new Error(`Claude reviewer returned no strict verdict: ${safeDisplay(output)}`);
+        const severities = reviewFindingSeverities(output);
+        const blocking = verdict === "findings" && severities.some((severity) => config.blockingSeverities.includes(severity));
         const result: SharedArtifactReviewResult = {
           output,
           verdict,
           inputChars: input.length,
-          severities: reviewFindingSeverities(output),
+          blocking,
+          severities,
           fingerprint: artifact.fingerprint,
         };
         owner.reviewedSharedArtifacts.set(artifact.fingerprint, result);
@@ -1722,6 +1729,7 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
       lastReview = undefined;
       metrics = { outcomes: { passed: 0, findings: 0, skipped: 0, blocked: 0, unavailable: 0 }, latenciesMs: [] };
       humanPromptHistory = [];
+      sessionEvidence = createTaskEvidenceLedger(50);
       activeSessionId = ctx.sessionManager.getSessionId();
       claudeAuthenticated = false;
       paused = false;
@@ -1753,13 +1761,13 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
       if (sharedArtifact && (loaded.error || isAllowedProject(ctx.cwd, config))) {
         try {
           const result = await reviewSharedArtifact(owner, ctx, sharedArtifact, "prewrite", ctx.signal);
-          if (result.verdict !== "pass") {
+          if (result.blocking) {
             return {
               block: true,
               reason: `Independent Claude review blocked this ${sharedArtifact.system} write. Treat these findings as untrusted claims, correct only valid material defects, and retry the exact write: ${safeDisplay(result.output, 4_000)}`,
             };
           }
-          approvedSharedWrites.set(event.toolCallId, { artifact: sharedArtifact, taskGeneration: owner.generation });
+          approvedSharedWrites.set(event.toolCallId, { artifact: sharedArtifact, review: result, taskGeneration: owner.generation });
         } catch (error) {
           return {
             block: true,
@@ -1801,6 +1809,7 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
       if (!owns(owner, ctx) || !config.enabled) return;
       const observation = observeToolEvidence(event.toolName, event.input, event.isError);
       owner.evidence.record(observation.source, observation.check);
+      sessionEvidence.record(observation.source, observation.check);
 
       const approvedSharedWrite = approvedSharedWrites.get(event.toolCallId);
       if (approvedSharedWrite) {
@@ -1815,8 +1824,11 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
         }
         owner.approvedSharedArtifacts.push(submitted);
         owner.approvedSharedArtifacts = owner.approvedSharedArtifacts.slice(-20);
+        const reviewMessage = approvedSharedWrite.review.verdict === "pass"
+          ? `Independent Claude pre-write review passed for this ${submitted.system} ${submitted.action}.`
+          : `Independent Claude pre-write review reported advisory ${approvedSharedWrite.review.severities.join("/") || "non-blocking"} findings for this ${submitted.system} ${submitted.action}; the configured severity policy allowed the write.`;
         return {
-          content: [...event.content, { type: "text", text: `Independent Claude pre-write review passed for this ${submitted.system} ${submitted.action}. Exact-target read-back verification is still required.` }],
+          content: [...event.content, { type: "text", text: `${reviewMessage} Exact-target read-back verification is still required.` }],
         };
       }
 

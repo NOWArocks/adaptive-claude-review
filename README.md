@@ -17,7 +17,7 @@ This is an independent project. It is not affiliated with or endorsed by Anthrop
 - Stops repeated reviewer failures with a task-local circuit breaker.
 - Runs Claude without tools or session persistence, with a minimal environment and an empty temporary working directory.
 
-Shared-system pre-write review evaluates the current mutation, not an impossible atomic representation of a multi-step workflow. When a later write depends on an identifier created by the current write, the first mutation can proceed after its own review. For example, Jira issue creation is reviewed and executed before a separate issue-link call uses the generated key. Exact-target read-back remains required after the writes.
+Shared-system pre-write review evaluates the current mutation, not an impossible atomic representation of a multi-step workflow. When a later write depends on an identifier created by the current write, the first mutation can proceed after its own review. For example, Jira issue creation is reviewed and executed before a separate issue-link call uses the generated key. Evidence metadata for shared-system reviews remains available across follow-up turns in the same Pi session. `Medium` findings are advisory by default for shared-system writes, matching the file-review severity policy. Exact-target read-back remains required after the writes.
 
 A Claude `PASS` is evidence from a bounded second model, not proof of correctness. Exact-target verification remains required.
 
@@ -165,7 +165,7 @@ See [SECURITY.md](SECURITY.md) for the complete boundary and residual risks.
 
 ## Evidence metadata
 
-The bounded task-local ledger records observed source access and recognized verification commands. It does not turn observations into proof.
+The bounded task-local ledger records observed source access and recognized verification commands. Shared-system reviews also use a bounded session ledger so follow-up write requests retain source-access metadata from earlier turns. Neither ledger turns observations into proof.
 
 A command is recognized only when it appears to execute a real test, build, lint, typecheck, or verify action. Help, version, dry-run, collect-only, piped, and failure-masked commands are not recorded as successful checks. Ledger output uses `OBSERVED SUCCESS`, not `PASS`, because tool success does not prove the exact product claim.
 
