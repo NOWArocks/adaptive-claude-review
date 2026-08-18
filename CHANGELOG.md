@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Review shared-system mutations as ordered pre-write steps and keep exact-target read-back as a post-write requirement.
+- Record nested Jira read evidence from MCP tool envelopes.
+- Allow blocking findings to be superseded for unchanged files only when the bounded review context changes.
+
 ## 0.1.1 (2026-08-11)
 
 - Add adaptive review policy, task-scoped file attribution, evidence metadata, delivery gating, correction turns, and bounded manual release.

@@ -382,10 +382,24 @@ function evidenceDetail(value: unknown, fallback: string): string {
   return normalized.slice(0, 240);
 }
 
+function evidenceInputLayers(input: Record<string, unknown>): Record<string, unknown>[] {
+  const layers = [input];
+  let current = input;
+  for (let depth = 0; depth < 6; depth++) {
+    const nested = current.arguments;
+    if (!nested || typeof nested !== "object" || Array.isArray(nested)) break;
+    current = nested as Record<string, unknown>;
+    layers.push(current);
+  }
+  return layers;
+}
+
 function firstString(input: Record<string, unknown>, keys: string[]): string | undefined {
-  for (const key of keys) {
-    const value = input[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
+  for (const values of evidenceInputLayers(input)) {
+    for (const key of keys) {
+      const value = values[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
   }
   return undefined;
 }
@@ -457,7 +471,7 @@ export function observeToolEvidence(
   }
 
   if (/jira/i.test(toolName) && !/(?:status|create|update|delete|transition|comment|assign)/i.test(toolName)) {
-    const issueKey = firstString(input, ["issueKey", "issue_key", "key"]);
+    const issueKey = firstString(input, ["issueIdOrKey", "issueKey", "issue_key", "key"]);
     const safeIssueKey = issueKey && /^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey) ? issueKey : undefined;
     return { source: { kind: "jira", detail: safeIssueKey ? `Jira issue read: ${safeIssueKey}` : `Successful Jira read via ${toolName.slice(0, 120)}` } };
   }

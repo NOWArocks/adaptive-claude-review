@@ -87,6 +87,13 @@ type ReviewPreparation = {
   decision: ReturnType<typeof classifyReview>;
 };
 
+type ReviewContextSnapshot = {
+  taskPrompt?: string;
+  evidenceSources: EvidenceSource[];
+  evidenceChecks: EvidenceCheck[];
+  evidenceObservations: EvidenceObservations;
+};
+
 type ReviewResult = {
   output: string;
   verdict: ReviewVerdict;
@@ -94,6 +101,8 @@ type ReviewResult = {
   blocking: boolean;
   severities: ReviewSeverity[];
   fingerprint: string;
+  taskContextFingerprint: string;
+  requestContextFingerprint: string;
   decision: ReturnType<typeof classifyReview>;
 };
 
@@ -153,10 +162,11 @@ type TaskState = {
   expectedHashes: Map<string, string>;
   pathRisks: Map<string, PathRisk>;
   reviewedResults: Map<string, ReviewResult>;
+  reviewedRequestContexts: Set<string>;
   reviewedSharedArtifacts: Map<string, SharedArtifactReviewResult>;
   approvedSharedArtifacts: SharedArtifactCandidate[];
   timedOutFingerprints: Set<string>;
-  feedbackQueuedFingerprints: Set<string>;
+  feedbackQueuedReviewContexts: Set<string>;
 };
 
 export type AdaptiveClaudeReviewOptions = {
@@ -556,6 +566,40 @@ function scopedFingerprint(snapshot: Snapshot, files: ChangedFile[]): string {
     .digest("hex");
 }
 
+function reviewContextFingerprint(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function reviewedContextKey(fileFingerprint: string, requestContextFingerprint: string): string {
+  return `${fileFingerprint}:${requestContextFingerprint}`;
+}
+
+function captureReviewContext(owner: TaskState): ReviewContextSnapshot {
+  return {
+    taskPrompt: owner.prompt,
+    evidenceSources: owner.evidence.sources(),
+    evidenceChecks: owner.evidence.checks(),
+    evidenceObservations: owner.evidence.observed(),
+  };
+}
+
+function taskReviewContextFingerprint(context: ReviewContextSnapshot): string {
+  return reviewContextFingerprint({
+    prompt: context.taskPrompt ?? "",
+    sources: context.evidenceSources,
+    checks: context.evidenceChecks,
+    observed: context.evidenceObservations,
+  });
+}
+
+function requestReviewContextFingerprint(context: ReviewContextSnapshot, rationale?: string, unverified: string[] = []): string {
+  return reviewContextFingerprint({
+    task: taskReviewContextFingerprint(context),
+    rationale: rationale?.trim() ?? "",
+    unverified: [...new Set(unverified.map((item) => item.trim()).filter(Boolean))].sort(),
+  });
+}
+
 function taskRelativePath(root: string, cwd: string, path: string): string | undefined {
   const canonicalRoot = canonicalPath(root);
   const absolutePath = canonicalPath(resolve(cwd, path));
@@ -728,6 +772,11 @@ Rules:
 - For Confluence and comments, check audience fit, decision clarity, unsupported claims, and action ownership.
 - Focus only on material defects: correctness, missing requested outcomes, contradictions, privacy or permission errors, broken user workflows, and ambiguous or untestable requirements.
 - Ignore cosmetic style preferences and optional rewrites.
+- This is a pre-write review. Do not require post-write evidence, a re-fetch, or another action that can only happen after the write. The primary agent must perform exact-target read-back separately after a successful write.
+- Treat technically dependent shared-system writes as a sequence. Review only the current mutation and do not require a later mutation to be embedded before its target exists. In particular, a Jira create-issue call cannot include a formal issue link through this tool: allow the issue to be created first so a later create-issue-link call can use its generated key. Report a finding only when the current mutation contradicts or prevents the requested follow-up.
+- Review only the proposed shared-system mutation. A separate chat draft, manual reply, or other deliverable does not need to be embedded in the shared-system payload unless the task explicitly requires that destination.
+- Do not treat missing automated checks as a finding for a content-only shared-system edit. Assess whether the proposed content is supported by the supplied task and evidence.
+- When the task requests a narrow edit to an existing artifact, do not require unchanged text to be rewritten or independently re-proven unless the narrow edit introduces a contradiction or material risk.
 - This review does not authorize the shared-system write.
 - If there are no material findings, return exactly "VERDICT: PASS" followed by one short explanation.
 - If there are material findings, start with "VERDICT: FINDINGS" and list each finding as Critical, High, or Medium with the smallest robust correction.
@@ -1176,10 +1225,11 @@ function createTaskState(generation: number, prompt?: string): TaskState {
     expectedHashes: new Map(),
     pathRisks: new Map(),
     reviewedResults: new Map(),
+    reviewedRequestContexts: new Set(),
     reviewedSharedArtifacts: new Map(),
     approvedSharedArtifacts: [],
     timedOutFingerprints: new Set(),
-    feedbackQueuedFingerprints: new Set(),
+    feedbackQueuedReviewContexts: new Set(),
   };
 }
 
@@ -1434,7 +1484,14 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
       assertOwner(owner, ctx);
       if (prepared.baseline !== owner.baseline) throw new Error("The prepared review belongs to a superseded task baseline.");
       if (!options.force && !prepared.decision.review) throw new Error(`Review policy skipped this change: ${formatDecision(prepared.decision)}.`);
-      if (owner.reviewedResults.has(prepared.fingerprint)) throw new Error("This exact session-scoped file state was already reviewed.");
+      const reviewContext = captureReviewContext(owner);
+      const taskContextFingerprint = taskReviewContextFingerprint(reviewContext);
+      const requestContextFingerprint = requestReviewContextFingerprint(reviewContext, options.rationale, options.unverified ?? []);
+      const existing = owner.reviewedResults.get(prepared.fingerprint);
+      const reviewedRequestContext = reviewedContextKey(prepared.fingerprint, requestContextFingerprint);
+      if (existing?.verdict === "pass" || owner.reviewedRequestContexts.has(reviewedRequestContext)) {
+        throw new Error("This exact session-scoped file state and review context were already reviewed.");
+      }
       if (owner.timedOutFingerprints.has(prepared.fingerprint)) throw new Error("This exact session-scoped file state already timed out. Change the state or scope before retrying.");
 
       owner.reviewInFlight = true;
@@ -1466,9 +1523,9 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
           prepared.decision,
           config.reviewPriorities,
           config.reviewProfiles,
-          owner.evidence.sources(),
-          owner.evidence.checks(),
-          owner.evidence.observed(),
+          reviewContext.evidenceSources,
+          reviewContext.evidenceChecks,
+          reviewContext.evidenceObservations,
           config.relatedContextFiles,
           config.topicDirectory,
           config.productArtifactPrefixes,
@@ -1477,7 +1534,7 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
           config.deniedPaths,
           config.sharedReviewPaths,
           options.rationale,
-          owner.prompt,
+          reviewContext.taskPrompt,
           bundleSignal,
         );
         inputChars = input.length;
@@ -1494,8 +1551,19 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
         if (verdict === "unknown") throw new Error(`Claude reviewer returned no strict verdict: ${safeDisplay(output)}`);
         const severities = reviewFindingSeverities(output);
         const blocking = verdict === "findings" && severities.some((severity) => config.blockingSeverities.includes(severity));
-        const result: ReviewResult = { output, verdict, inputChars: input.length, blocking, severities, fingerprint: prepared.fingerprint, decision: prepared.decision };
+        const result: ReviewResult = {
+          output,
+          verdict,
+          inputChars: input.length,
+          blocking,
+          severities,
+          fingerprint: prepared.fingerprint,
+          taskContextFingerprint,
+          requestContextFingerprint,
+          decision: prepared.decision,
+        };
         owner.reviewedResults.set(prepared.fingerprint, result);
+        owner.reviewedRequestContexts.add(reviewedRequestContext);
         owner.consecutiveFailures = 0;
         setLast(owner, verdict === "pass" ? "passed" : "findings", prepared.files.map((file) => file.path), prepared.decision.reasons, startedAt, verdict === "findings" ? output : undefined, undefined, true, input.length);
         return result;
@@ -1890,8 +1958,9 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
         return { message: heldMessage("Independent review still has unresolved blocking findings and the automatic review budget is exhausted. The final response was withheld; it was not delivered and has no Claude PASS. Inspect it with /claude-review-last draft. To release that exact draft deliberately, run /claude-review-release <reason>.") };
       };
       const queueFindings = async (result: ReviewResult) => {
-        if (owner.correctionTurns >= maximumCorrectionTurns(config) || owner.feedbackQueuedFingerprints.has(result.fingerprint)) return false;
-        owner.feedbackQueuedFingerprints.add(result.fingerprint);
+        const feedbackContext = reviewedContextKey(result.fingerprint, result.requestContextFingerprint);
+        if (owner.correctionTurns >= maximumCorrectionTurns(config) || owner.feedbackQueuedReviewContexts.has(feedbackContext)) return false;
+        owner.feedbackQueuedReviewContexts.add(feedbackContext);
         const boundary = randomBytes(12).toString("hex");
         const findings = truncateBundleContent(result.output, MAX_STEERING_OUTPUT_CHARS, "Review findings");
         const boundedDraft = truncateBundleContent(withheldDraft, MAX_TASK_CHARS, "Withheld draft");
@@ -1912,7 +1981,7 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
         } catch {
           owner.deliveryDraftHidden = false;
           owner.correctionPending = false;
-          owner.feedbackQueuedFingerprints.delete(result.fingerprint);
+          owner.feedbackQueuedReviewContexts.delete(feedbackContext);
           return false;
         }
         owner.correctionTurns++;
@@ -1942,11 +2011,18 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
           setLast(owner, "skipped", completeScope, ["No changed files match the attributed scope."], startedAt);
           return;
         }
-        const existing = owner.reviewedResults.get(prepared.fingerprint);
+        const cached = owner.reviewedResults.get(prepared.fingerprint);
         const correctionReviewRequired = owner.correctionPending;
+        const existing = correctionReviewRequired
+          && cached?.verdict === "findings"
+          && cached.taskContextFingerprint !== taskReviewContextFingerprint(captureReviewContext(owner))
+          ? undefined
+          : cached;
         const gateAction = decideDeliveryGate({
           existingVerdict: effectiveVerdict(existing),
-          feedbackAlreadyQueued: owner.feedbackQueuedFingerprints.has(prepared.fingerprint),
+          feedbackAlreadyQueued: existing
+            ? owner.feedbackQueuedReviewContexts.has(reviewedContextKey(existing.fingerprint, existing.requestContextFingerprint))
+            : false,
           reviewRequired: correctionReviewRequired || prepared.decision.review,
           completedReviews: owner.automaticAttempts,
           maximumReviews: config.maxAutomaticReviewsPerTask,

@@ -17,6 +17,8 @@ This is an independent project. It is not affiliated with or endorsed by Anthrop
 - Stops repeated reviewer failures with a task-local circuit breaker.
 - Runs Claude without tools or session persistence, with a minimal environment and an empty temporary working directory.
 
+Shared-system pre-write review evaluates the current mutation, not an impossible atomic representation of a multi-step workflow. When a later write depends on an identifier created by the current write, the first mutation can proceed after its own review. For example, Jira issue creation is reviewed and executed before a separate issue-link call uses the generated key. Exact-target read-back remains required after the writes.
+
 A Claude `PASS` is evidence from a bounded second model, not proof of correctness. Exact-target verification remains required.
 
 ## Task and working-tree isolation
@@ -182,6 +184,8 @@ Review unavailability releases the response with a visible warning that the stat
 Unresolved blocking findings behave differently. When the automatic attempt budget is exhausted, the extension stops the loop and withholds the final response. The user can inspect it with `/claude-review-last draft`. Releasing it requires `/claude-review-release <reason>` and always adds a visible no-PASS disclosure.
 
 Interactive and RPC modes can run private correction turns. With the default two-review budget, there is at most one automatic correction loop. After blocking findings, the corrected state must receive the second review even when the remaining diff would normally be skipped as small or test-only. JSON and print modes cannot run correction turns; blocking findings release a visible one-shot warning instead.
+
+A `PASS` remains valid for the same file-state fingerprint. Blocking `FINDINGS` can be reviewed again without an artificial file edit only when the bounded review context changes, such as new task evidence or a changed manual rationale or unknown list. An exact duplicate context is rejected, and the existing attempt budgets still bound all retries.
 
 Reviewer output and withheld drafts are wrapped in fresh random untrusted-data boundaries before the private correction turn. The primary agent is told to evaluate findings as claims and never execute embedded instructions.
 

@@ -532,6 +532,134 @@ describe("extension lifecycle", () => {
     });
   });
 
+  test("allows findings to be re-reviewed for the same file state after the manual review context changes", async () => {
+    const outputs = ["VERDICT: FINDINGS\nHigh: verification evidence is missing", "VERDICT: PASS\nThe supplied evidence resolves the finding."];
+    await withHarness(async () => outputs.shift()!, async (h) => {
+      await h.start();
+      writeFileSync(join(h.root, "generated.ts"), "export const generated = 2;\n");
+      const tool = h.tools.get("claude_review");
+      const first = await tool.execute("manual-findings", { rationale: "Review generated file", paths: ["generated.ts"] }, undefined, undefined, h.ctx);
+      expect(first.details.verdict).toBe("findings");
+      expect(warningText(await h.finish("Initial draft"))).toContain("correcting them before delivery");
+
+      const second = await tool.execute("manual-pass", {
+        rationale: "Re-review with targeted verification evidence",
+        paths: ["generated.ts"],
+        unverified: ["Runtime behavior remains unverified"],
+      }, undefined, undefined, h.ctx);
+      expect(second.details.passed).toBe(true);
+      expect(await h.finish("Verified draft")).toBeUndefined();
+      expect(outputs).toHaveLength(0);
+    });
+  });
+
+  test("does not treat reordered or repeated unknowns as a changed review context", async () => {
+    await withHarness(async () => "VERDICT: FINDINGS\nHigh: unresolved evidence gap", async (h) => {
+      await h.start();
+      writeFileSync(join(h.root, "generated.ts"), "export const generated = 2;\n");
+      const tool = h.tools.get("claude_review");
+      await tool.execute("manual-findings", {
+        rationale: "Review generated file",
+        paths: ["generated.ts"],
+        unverified: ["Runtime behavior", "External API"],
+      }, undefined, undefined, h.ctx);
+      await expect(tool.execute("manual-duplicate", {
+        rationale: "Review generated file",
+        paths: ["generated.ts"],
+        unverified: ["External API", "Runtime behavior", "External API"],
+      }, undefined, undefined, h.ctx)).rejects.toThrow("already reviewed");
+      await h.command("claude-review-status");
+      expect(h.notifications.at(-1)?.message).toContain("manual 1/3");
+    });
+  });
+
+  test("remembers every reviewed context for a file state instead of allowing A-B-A retries", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: FINDINGS\nHigh: unresolved evidence gap";
+    }, async (h) => {
+      await h.start();
+      writeFileSync(join(h.root, "generated.ts"), "export const generated = 2;\n");
+      const tool = h.tools.get("claude_review");
+      await tool.execute("context-a", { rationale: "Context A", paths: ["generated.ts"] }, undefined, undefined, h.ctx);
+      await tool.execute("context-b", { rationale: "Context B", paths: ["generated.ts"] }, undefined, undefined, h.ctx);
+      await expect(tool.execute("context-a-again", { rationale: "Context A", paths: ["generated.ts"] }, undefined, undefined, h.ctx)).rejects.toThrow("already reviewed");
+      expect(calls).toBe(2);
+      await h.command("claude-review-status");
+      expect(h.notifications.at(-1)?.message).toContain("manual 2/3");
+    });
+  });
+
+  test("automatically re-reviews unchanged files when correction work adds task evidence", async () => {
+    const outputs = ["VERDICT: FINDINGS\nHigh: no targeted test evidence", "VERDICT: PASS\nThe new test evidence resolves the finding."];
+    await withHarness(async () => outputs.shift()!, async (h) => {
+      await h.start();
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      expect(warningText(await h.finish("Initial draft"))).toContain("correcting them before delivery");
+
+      await h.emit("tool_result", {
+        type: "tool_result",
+        toolCallId: "verify-unchanged-state",
+        toolName: "bash",
+        input: { command: "bun test" },
+        isError: false,
+        content: [{ type: "text", text: "tests passed" }],
+      });
+      expect(await h.finish("Evidence-backed draft")).toBeUndefined();
+      expect(outputs).toHaveLength(0);
+    });
+  });
+
+  test("does not re-review unchanged findings when neither files nor review context changed", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: FINDINGS\nHigh: unresolved authorization concern";
+    }, async (h) => {
+      await h.start();
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      expect(warningText(await h.finish("Initial draft"))).toContain("correcting them before delivery");
+      expect(warningText(await h.finish("Unchanged draft"))).toContain("unresolved blocking findings");
+      expect(calls).toBe(1);
+    });
+  });
+
+  test("queues fresh findings for each changed review context within the configured correction budget", async () => {
+    const outputs = [
+      "VERDICT: FINDINGS\nHigh: first evidence gap",
+      "VERDICT: FINDINGS\nHigh: second evidence gap",
+      "VERDICT: PASS\nAll evidence gaps resolved.",
+    ];
+    await withHarness(async () => outputs.shift()!, async (h) => {
+      await h.start();
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      expect(warningText(await h.finish("Initial draft"))).toContain("correcting them before delivery");
+
+      await h.emit("tool_result", {
+        type: "tool_result",
+        toolCallId: "first-context-check",
+        toolName: "bash",
+        input: { command: "bun test" },
+        isError: false,
+        content: [{ type: "text", text: "tests passed" }],
+      });
+      expect(warningText(await h.finish("Second draft"))).toContain("correcting them before delivery");
+      expect(h.messages).toHaveLength(2);
+
+      await h.emit("tool_result", {
+        type: "tool_result",
+        toolCallId: "second-context-check",
+        toolName: "bash",
+        input: { command: "bun run typecheck" },
+        isError: false,
+        content: [{ type: "text", text: "typecheck passed" }],
+      });
+      expect(await h.finish("Final draft")).toBeUndefined();
+      expect(outputs).toHaveLength(0);
+    }, "rpc", { maxAutomaticReviewsPerTask: 3 });
+  });
+
   test("withholds the draft if private findings cannot be queued", async () => {
     await withHarness(async () => "VERDICT: FINDINGS\nHigh: unsafe permission", async (h) => {
       await h.start();
@@ -594,9 +722,41 @@ describe("extension lifecycle", () => {
       expect(calls).toBe(1);
       expect(reviewInput).toContain("Create the Jira implementation task");
       expect(reviewInput).toContain("Acceptance criteria");
+      expect(reviewInput).toContain("Do not require post-write evidence, a re-fetch");
+      expect(reviewInput).toContain("A separate chat draft, manual reply, or other deliverable does not need to be embedded");
+      expect(reviewInput).toContain("Do not treat missing automated checks as a finding for a content-only shared-system edit");
+      expect(reviewInput).toContain("do not require unchanged text to be rewritten or independently re-proven");
       expect(reviewInput).not.toContain("target WKW: Implement survey:");
       const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-create", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
       expect(result.content.at(-1).text).toContain("pre-write review passed");
+      expect(result.content.at(-1).text).toContain("Exact-target read-back verification is still required");
+    });
+  });
+
+  test("allows the dependent create then link Jira workflow without requiring a link in the create payload", async () => {
+    let calls = 0;
+    await withHarness(async (_config, input) => {
+      calls++;
+      expect(input).toContain("Treat technically dependent shared-system writes as a sequence");
+      expect(input).toContain("allow the issue to be created first so a later create-issue-link call can use its generated key");
+      return "VERDICT: PASS\nThe create payload is ready for the first workflow step.";
+    }, async (h) => {
+      await h.start("Create a Jira task and link it to WKW-2881");
+      const createInput = {
+        arguments: {
+          projectKey: "WKW",
+          issueTypeName: "Task",
+          summary: "Implement Grant Finder results",
+          description: "Acceptance criteria",
+        },
+      };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-create-step", toolName: "mcp_http_atlassian_createjiraissue", input: createInput })).toBeUndefined();
+      const createResult = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-create-step", toolName: "mcp_http_atlassian_createjiraissue", input: createInput, isError: false, content: [] });
+      expect(createResult.content.at(-1).text).toContain("pre-write review passed");
+
+      const linkInput = { arguments: { inwardIssue: "WKW-3000", outwardIssue: "WKW-2881", type: "Relates" } };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-link-step", toolName: "mcp_http_atlassian_createissuelink", input: linkInput })).toBeUndefined();
+      expect(calls).toBe(1);
     });
   });
 

@@ -703,6 +703,17 @@ describe("task-local review evidence", () => {
     expect(observeToolEvidence("jira_get_issue", { issueKey: "PROJ-123" }, false)).toEqual({
       source: { kind: "jira", detail: "Jira issue read: PROJ-123" },
     });
+    expect(observeToolEvidence("mcp_http_atlassian_getjiraissue", {
+      arguments: { arguments: { issueIdOrKey: "WKW-2973" } },
+    }, false)).toEqual({
+      source: { kind: "jira", detail: "Jira issue read: WKW-2973" },
+    });
+    expect(observeToolEvidence("mcp_http_atlassian_getjiraissue", {
+      issueIdOrKey: "WKW-2974",
+      arguments: { issueIdOrKey: "WKW-9999" },
+    }, false)).toEqual({
+      source: { kind: "jira", detail: "Jira issue read: WKW-2974" },
+    });
     expect(observeToolEvidence("jira_status", {}, false)).toEqual({});
     expect(observeToolEvidence("jira_update_issue", { issueKey: "PROJ-123" }, false)).toEqual({});
   });
