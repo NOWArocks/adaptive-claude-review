@@ -16,6 +16,7 @@
     "Critical",
     "High"
   ],
+  "sharedArtifactWriteMode": "advisory",
   "showOutboundNotice": true,
   "reviewDocumentation": true,
   "relatedContextFiles": [

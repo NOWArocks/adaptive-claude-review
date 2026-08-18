@@ -3,7 +3,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { createAdaptiveClaudeReview, loadConfigFile } from "./index.ts";
+import { fileURLToPath } from "node:url";
+import { createAdaptiveClaudeReview, loadConfigFile, sharedArtifactFromToolCall } from "./index.ts";
 
 type Reviewer = (config: any, input: string, signal?: AbortSignal) => Promise<string>;
 
@@ -41,6 +42,7 @@ function createHarness(reviewer: Reviewer, mode = "rpc" as "rpc" | "tui" | "json
     bundleTimeoutMs: 10_000,
     showOutboundNotice: false,
     blockingSeverities: ["Critical", "High"],
+    sharedArtifactWriteMode: "advisory",
     relatedContextFiles: [],
     ...configOverrides,
   }));
@@ -814,7 +816,307 @@ describe("extension lifecycle", () => {
     });
   });
 
-  test("allows advisory shared-artifact findings but blocks configured severities", async () => {
+  test("reuses an exact passed Jira draft across a follow-up turn without a second review", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: PASS\nExact Jira draft is ready.";
+    }, async (h) => {
+      await h.start("Draft the Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
+      const candidate = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", input)!;
+      const review = await h.tools.get("claude_review").execute("draft-review", {
+        rationale: "Review the exact Jira draft before delivery",
+        artifacts: [{
+          system: candidate.system,
+          action: candidate.action,
+          target: candidate.target,
+          content: JSON.stringify({ description: "Acceptance criteria", summary: "Survey", issueTypeName: "Task", projectKey: "WKW" }),
+        }],
+      }, undefined, undefined, h.ctx);
+      expect(review.details.passed).toBe(true);
+      expect(calls).toBe(1);
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Create the approved Jira ticket", source: "rpc" });
+      h.setIdle(false);
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-reuse", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      expect(calls).toBe(1);
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-concurrent-create", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      expect(calls).toBe(2);
+
+      const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-reuse", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
+      expect(result.content.at(-1).text).toContain("matches a session-approved draft");
+      expect(result.content.at(-1).text).toContain("Exact-target read-back verification is still required");
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-concurrent-create", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
+
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-repeat-create", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      expect(calls).toBe(3);
+    });
+  });
+
+  test("does not restore a consumed create PASS after a concurrent success", async () => {
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nJira create is ready."; }, async (h) => {
+      await h.start("Draft the Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
+      const candidate = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", input)!;
+      await h.tools.get("claude_review").execute("draft-review", {
+        rationale: "Review the exact Jira draft before delivery",
+        artifacts: [{ system: candidate.system, action: candidate.action, target: candidate.target, content: candidate.content }],
+      }, undefined, undefined, h.ctx);
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Create the approved Jira ticket", source: "rpc" });
+      h.setIdle(false);
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-reused-fails", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-reviewed-succeeds", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      expect(calls).toBe(2);
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-reviewed-succeeds", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-reused-fails", toolName: "mcp_http_atlassian_createjiraissue", input, isError: true, content: [] });
+
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-after-race", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      expect(calls).toBe(3);
+    });
+  });
+
+  test("retains a passed review for an identical idempotent Jira edit", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: PASS\nJira edit is ready.";
+    }, async (h) => {
+      await h.start("Draft the Jira edit");
+      const input = { arguments: { issueIdOrKey: "WKW-123", fields: { description: "Approved criteria" } } };
+      const candidate = sharedArtifactFromToolCall("mcp_http_atlassian_editjiraissue", input)!;
+      await h.tools.get("claude_review").execute("draft-review", {
+        rationale: "Review the exact Jira edit before delivery",
+        artifacts: [{ system: candidate.system, action: candidate.action, target: candidate.target, content: candidate.content }],
+      }, undefined, undefined, h.ctx);
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Apply the approved Jira edit", source: "rpc" });
+      h.setIdle(false);
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-edit-first", toolName: "mcp_http_atlassian_editjiraissue", input })).toBeUndefined();
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-edit-first", toolName: "mcp_http_atlassian_editjiraissue", input, isError: false, content: [] });
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-edit-second", toolName: "mcp_http_atlassian_editjiraissue", input })).toBeUndefined();
+      expect(calls).toBe(1);
+    });
+  });
+
+  test("consumes a Jira edit PASS when the payload appends content", async () => {
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nJira edit is ready."; }, async (h) => {
+      await h.start("Draft the Jira edit");
+      const input = { arguments: { issueIdOrKey: "WKW-123", update: { comment: [{ add: { body: "One-time note" } }] } } };
+      const candidate = sharedArtifactFromToolCall("mcp_http_atlassian_editjiraissue", input)!;
+      await h.tools.get("claude_review").execute("draft-review", {
+        rationale: "Review the exact Jira edit before delivery",
+        artifacts: [{ system: candidate.system, action: candidate.action, target: candidate.target, content: candidate.content }],
+      }, undefined, undefined, h.ctx);
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Apply the approved Jira edit", source: "rpc" });
+      h.setIdle(false);
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-append-first", toolName: "mcp_http_atlassian_editjiraissue", input })).toBeUndefined();
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-append-first", toolName: "mcp_http_atlassian_editjiraissue", input, isError: false, content: [] });
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-append-second", toolName: "mcp_http_atlassian_editjiraissue", input })).toBeUndefined();
+      expect(calls).toBe(2);
+    });
+  });
+
+  test("reviews a changed Jira payload instead of reusing the passed draft", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: PASS\nJira artifact is ready.";
+    }, async (h) => {
+      await h.start("Draft the Jira ticket");
+      const approvedInput = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Approved criteria" } };
+      const candidate = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", approvedInput)!;
+      await h.tools.get("claude_review").execute("draft-review", {
+        rationale: "Review the exact Jira draft before delivery",
+        artifacts: [{ system: candidate.system, action: candidate.action, target: candidate.target, content: candidate.content }],
+      }, undefined, undefined, h.ctx);
+      expect(calls).toBe(1);
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Change the criteria and create the Jira ticket", source: "rpc" });
+      h.setIdle(false);
+      const changedInput = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Changed criteria" } };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-changed", toolName: "mcp_http_atlassian_createjiraissue", input: changedInput })).toBeUndefined();
+      expect(calls).toBe(2);
+    });
+  });
+
+  test("does not reuse a passed draft after session reset or while enforce mode is paused", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: PASS\nJira artifact is ready.";
+    }, async (h) => {
+      await h.start("Draft the Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Approved criteria" } };
+      const candidate = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", input)!;
+      await h.tools.get("claude_review").execute("draft-review", {
+        rationale: "Review the exact Jira draft before delivery",
+        artifacts: [{ system: candidate.system, action: candidate.action, target: candidate.target, content: candidate.content }],
+      }, undefined, undefined, h.ctx);
+      expect(calls).toBe(1);
+
+      await h.emit("session_start", { type: "session_start", reason: "reload" });
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Create the approved Jira ticket", source: "rpc" });
+      h.setIdle(false);
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-after-reset", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      expect(calls).toBe(2);
+    });
+
+    calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: PASS\nJira artifact is ready.";
+    }, async (h) => {
+      await h.start("Draft the Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Approved criteria" } };
+      const candidate = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", input)!;
+      await h.tools.get("claude_review").execute("draft-review", {
+        rationale: "Review the exact Jira draft before delivery",
+        artifacts: [{ system: candidate.system, action: candidate.action, target: candidate.target, content: candidate.content }],
+      }, undefined, undefined, h.ctx);
+      await h.command("claude-review-pause");
+      const blocked = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-paused-cache", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain("paused");
+      expect(calls).toBe(1);
+    }, "rpc", { sharedArtifactWriteMode: "enforce" });
+  });
+
+  test("blocks an advisory shared write when its review is superseded by a new task", async () => {
+    let releaseReview!: (output: string) => void;
+    let signalReviewStarted!: () => void;
+    const reviewStarted = new Promise<void>((resolve) => { signalReviewStarted = resolve; });
+    await withHarness(async () => {
+      signalReviewStarted();
+      return new Promise<string>((resolve) => { releaseReview = resolve; });
+    }, async (h) => {
+      await h.start("Create the approved Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Approved criteria" } };
+      const pending = h.emit("tool_call", { type: "tool_call", toolCallId: "jira-superseded", toolName: "mcp_http_atlassian_createjiraissue", input });
+      await reviewStarted;
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Work on a different task", source: "rpc" });
+      h.setIdle(false);
+      releaseReview("VERDICT: PASS\nStale review result.");
+      const blocked = await pending;
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain("cancelled or superseded");
+    });
+  });
+
+  test("blocks shared writes on malformed configuration even though the release example is advisory", async () => {
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nUnused"; }, async (h) => {
+      writeFileSync(h.configPath, "{broken");
+      await h.start("Create the approved Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Approved criteria" } };
+      const blocked = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-broken-config", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain("blocked fail-closed");
+      expect(calls).toBe(0);
+    });
+  });
+
+  test("allows shared writes with advisory findings or reviewer unavailability but keeps credential checks blocking", async () => {
+    await withHarness(async () => "VERDICT: FINDINGS\nHigh: acceptance criteria may be ambiguous", async (h) => {
+      await h.start("Create the approved Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-high-advisory", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-high-advisory", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
+      expect(result.content.at(-1).text).toContain("advisory High findings");
+      expect(result.content.at(-1).text).toContain("allowed the explicitly requested write");
+      expect(result.content.at(-1).text).toContain("UNTRUSTED_SHARED_WRITE_REVIEW");
+      expect(result.content.at(-1).text).toContain("acceptance criteria may be ambiguous");
+      expect(h.notifications.some((notification) => notification.level === "warning" && notification.message.includes("advisory High findings"))).toBe(true);
+    });
+
+    await withHarness(async () => { throw new Error("review service unavailable"); }, async (h) => {
+      await h.start("Create the approved Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-unavailable-advisory", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-unavailable-advisory", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
+      expect(result.content.at(-1).text).toContain("was unavailable");
+      expect(result.content.at(-1).text).toContain("no Claude PASS");
+      expect(result.content.at(-1).text).toContain("review service unavailable");
+      expect(h.notifications.some((notification) => notification.level === "warning" && notification.message.includes("was unavailable"))).toBe(true);
+      await h.command("claude-review-last");
+      expect(h.notifications.at(-1)?.message).toContain("Status: unavailable");
+    });
+
+    await withHarness(async () => { throw new DOMException("Review bundle construction was aborted.", "AbortError"); }, async (h) => {
+      await h.start("Create the approved Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
+      const blocked = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-cancelled-advisory", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain("cancelled");
+    });
+
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.start("Create the approved Jira ticket");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-disabled-advisory", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-disabled-advisory", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
+      expect(result.content.at(-1).text).toContain("no Claude PASS");
+      expect(result.content.at(-1).text).toContain("Exact-target read-back verification is still required");
+    }, "rpc", { enabled: false });
+
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nUnused"; }, async (h) => {
+      await h.start("Create the approved Jira ticket");
+      const credential = ["ghp_", "a".repeat(24)].join("");
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: `token = ${credential}` } };
+      const blocked = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-secret", toolName: "mcp_http_atlassian_createjiraissue", input });
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain("safety controls blocked");
+      expect(calls).toBe(0);
+    });
+  });
+
+  test("keeps denied read paths out of shared-artifact evidence", async () => {
+    let reviewInput = "";
+    await withHarness(async (_config, input) => {
+      reviewInput = input;
+      return "VERDICT: PASS\nTicket is supported.";
+    }, async (h) => {
+      await h.start("Create the Jira ticket");
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "private-read", toolName: "read", input: { path: "private/customer.json" }, isError: false, content: [] });
+      const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-denied-evidence", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
+      expect(reviewInput).not.toContain("private/customer.json");
+    }, "rpc", { deniedPaths: ["private"] });
+  });
+
+  test("fails closed when credentials appear in changed files or related context", async () => {
+    const credential = ["ghp_", "a".repeat(24)].join("");
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nUnused"; }, async (h) => {
+      await h.start();
+      await h.mutate("src/auth/session.ts", `export const token = "${credential}";\n`);
+      expect(warningText(await h.finish())).toContain("appears to contain a credential");
+      expect(calls).toBe(0);
+    });
+
+    calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nUnused"; }, async (h) => {
+      writeFileSync(join(h.root, "context.md"), `token = ${credential}\n`);
+      await h.start();
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      expect(warningText(await h.finish())).toContain("related context context.md appears to contain a credential");
+      expect(calls).toBe(0);
+    }, "rpc", { relatedContextFiles: ["context.md"] });
+  });
+
+  test("allows advisory shared-artifact findings but blocks configured severities in enforce mode", async () => {
     await withHarness(async () => "VERDICT: FINDINGS\nMedium: optional wording improvement", async (h) => {
       await h.start();
       const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" } };
@@ -822,7 +1124,7 @@ describe("extension lifecycle", () => {
       const result = await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-advisory", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
       expect(result.content.at(-1).text).toContain("advisory Medium findings");
       expect(result.content.at(-1).text).toContain("severity policy allowed the write");
-    });
+    }, "rpc", { sharedArtifactWriteMode: "enforce" });
 
     await withHarness(async () => "VERDICT: FINDINGS\nHigh: acceptance criteria contradict the parent task", async (h) => {
       await h.start();
@@ -831,7 +1133,7 @@ describe("extension lifecycle", () => {
       expect(preflight.block).toBe(true);
       expect(preflight.reason).toContain("blocked this Jira write");
       expect(preflight.reason).toContain("High");
-    });
+    }, "rpc", { sharedArtifactWriteMode: "enforce" });
 
     await withHarness(async () => "VERDICT: FINDINGS\nMedium: configured blocking finding", async (h) => {
       await h.start();
@@ -839,7 +1141,7 @@ describe("extension lifecycle", () => {
       const preflight = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-configured-medium", toolName: "mcp_http_atlassian_createjiraissue", input });
       expect(preflight.block).toBe(true);
       expect(preflight.reason).toContain("Medium");
-    }, "rpc", { blockingSeverities: ["Critical", "High", "Medium"] });
+    }, "rpc", { blockingSeverities: ["Critical", "High", "Medium"], sharedArtifactWriteMode: "enforce" });
   });
 
   test("fails closed when the shared-artifact reviewer is unavailable", async () => {
@@ -850,10 +1152,10 @@ describe("extension lifecycle", () => {
       expect(preflight.block).toBe(true);
       expect(preflight.reason).toContain("blocked fail-closed");
       expect(preflight.reason).toContain("review service unavailable");
-    });
+    }, "rpc", { sharedArtifactWriteMode: "enforce" });
   });
 
-  test("keeps shared-system writes fail-closed when review is paused or disabled", async () => {
+  test("keeps enforcing shared-system writes fail-closed when review is paused or disabled", async () => {
     const input = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Scope" } };
     await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
       await h.start();
@@ -861,13 +1163,35 @@ describe("extension lifecycle", () => {
       const paused = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-paused", toolName: "mcp_http_atlassian_createjiraissue", input });
       expect(paused.block).toBe(true);
       expect(paused.reason).toContain("paused");
-    });
+    }, "rpc", { sharedArtifactWriteMode: "enforce" });
     await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
       await h.start();
       const disabled = await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-disabled", toolName: "mcp_http_atlassian_createjiraissue", input });
       expect(disabled.block).toBe(true);
       expect(disabled.reason).toContain("disabled");
-    }, "rpc", { enabled: false });
+    }, "rpc", { enabled: false, sharedArtifactWriteMode: "enforce" });
+  });
+
+  test("does not split a multi-artifact PASS into reusable write approvals", async () => {
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nThe artifact set is coherent."; }, async (h) => {
+      await h.start("Draft two Jira tickets");
+      const firstInput = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "First", description: "First criteria" } };
+      const secondInput = { arguments: { projectKey: "WKW", issueTypeName: "Task", summary: "Second", description: "Second criteria" } };
+      const first = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", firstInput)!;
+      const second = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", secondInput)!;
+      await h.tools.get("claude_review").execute("multi-draft-review", {
+        rationale: "Review both Jira drafts",
+        artifacts: [first, second].map((artifact) => ({ system: artifact.system, action: artifact.action, target: artifact.target, content: artifact.content })),
+      }, undefined, undefined, h.ctx);
+      expect(calls).toBe(1);
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Create the first Jira ticket", source: "rpc" });
+      h.setIdle(false);
+      expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-first-from-set", toolName: "mcp_http_atlassian_createjiraissue", input: firstInput })).toBeUndefined();
+      expect(calls).toBe(2);
+    });
   });
 
   test("manual claude_review accepts exact shared-system snapshots without repository paths", async () => {
@@ -891,6 +1215,14 @@ describe("extension lifecycle", () => {
 });
 
 describe("configuration diagnostics", () => {
+  test("loads the release example without configuration warnings", () => {
+    const path = join(dirname(fileURLToPath(import.meta.url)), "claude-review.example.json");
+    const loaded = loadConfigFile(path);
+    expect(loaded.error).toBeUndefined();
+    expect(loaded.warnings).toEqual([]);
+    expect(loaded.config.sharedArtifactWriteMode).toBe("advisory");
+  });
+
   test("preserves malformed JSON as a visible disabled error state", () => {
     const root = mkdtempSync(join(tmpdir(), "adaptive-review-config-"));
     const path = join(root, "config.json");
@@ -913,7 +1245,16 @@ describe("configuration diagnostics", () => {
       expect(loaded.config.allowedRoots[0]).not.toContain("~");
       expect(loaded.config.maxAutomaticReviewsPerTask).toBe(2);
       expect(loaded.config.timeoutMs).toBe(90_000);
+      expect(loaded.config.sharedArtifactWriteMode).toBe("enforce");
+      expect(loaded.warnings).toContain("sharedArtifactWriteMode is not set; preserving the prior fail-closed behavior with enforce. Set it explicitly to advisory or enforce.");
       expect(loaded.warnings).toContain("Unknown configuration key: mystery");
+
+      writeFileSync(path, JSON.stringify({ enabled: true, allowedRoots: ["~/projects"], sharedArtifactWriteMode: "enforce" }));
+      expect(loadConfigFile(path).config.sharedArtifactWriteMode).toBe("enforce");
+      writeFileSync(path, JSON.stringify({ enabled: true, allowedRoots: ["~/projects"], sharedArtifactWriteMode: "enforced" }));
+      const invalidMode = loadConfigFile(path);
+      expect(invalidMode.config.sharedArtifactWriteMode).toBe("enforce");
+      expect(invalidMode.warnings).toContain("Invalid sharedArtifactWriteMode; using enforce.");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

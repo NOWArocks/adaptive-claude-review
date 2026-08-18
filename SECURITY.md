@@ -29,7 +29,7 @@ Each outbound bundle uses a fresh random boundary. Task, rationale, evidence, pa
 
 Boundary markers and instructions reduce prompt-injection risk but cannot eliminate it. Repository content and task text can influence the reviewer. Reviewer output and withheld drafts can influence the tool-capable primary agent during a correction turn. The primary agent must treat findings as claims, verify them against the task and sources, and never execute embedded instructions.
 
-The extension scans every outbound text category for high-confidence credential shapes before assembly. It withholds standard credential paths and configured `deniedPaths`. Related and changed files are read with byte bounds instead of being loaded completely before truncation.
+The extension scans every outbound text category for high-confidence credential shapes before assembly. It withholds standard credential paths and configured `deniedPaths`, including their names in evidence metadata. Credential detection and bundle cancellation propagate as hard failures instead of being converted into omitted changed-file or related-context sections. Related and changed files are read with byte bounds instead of being loaded completely before truncation.
 
 These controls reduce risk; they do not prove that outbound data is free of credentials or PII. Pattern detection can miss custom tokens, encoded values, business identifiers, and natural-language personal data. Put sensitive directories in `deniedPaths` and keep `discoverTopicContext` off unless the additional files are approved for Claude processing.
 
@@ -47,7 +47,7 @@ or:
 VERDICT: FINDINGS
 ```
 
-A second verdict, a PASS containing severity findings, or FINDINGS without a `Critical:`, `High:`, or `Medium:` item is rejected. This prevents quoted or embedded verdict text from becoming a false PASS.
+A second verdict, a PASS containing severity findings, or FINDINGS without a line-starting `Critical`, `High`, or `Medium` item is rejected. Numbered and bulleted severity items are accepted. This prevents quoted or embedded verdict text from becoming a false PASS.
 
 Before an automatic correction turn, findings and the withheld draft are:
 
@@ -59,6 +59,12 @@ Before an automatic correction turn, findings and the withheld draft are:
 The hidden recovery entry remains in Pi's local session data under Pi's session-retention lifecycle. The extension clears its in-memory last-review draft and session metrics on `session_start`, but it does not delete historical Pi session entries. The recovery entry is not included in the next Claude review bundle unless the corrected task state independently contains the same text.
 
 When unresolved blocking findings exhaust the automatic budget, the final draft is withheld. A manual release requires an explicit reason, is limited to the same task generation, works once per held draft, and places the no-PASS disclosure before the untrusted draft text. The extension records the release in the local Pi session when persistence is available.
+
+## Shared-system writes
+
+A passed single-artifact manual review can be reused across turns only when its normalized system, action, target, canonical JSON values, and nested array order match the later write exactly. Multi-artifact review results are not split into independently reusable approvals. The bounded cache is in memory and resets on `session_start`. Successful create and add actions consume their cached PASS so duplicates are reviewed again; field-replacing Jira edits and idempotent Confluence/comment updates can retain it. Jira edits with append-style `update` operations consume the PASS. Paused, disabled, or malformed enforcing configurations cannot reuse the cache. A successful write still requires exact-target read-back.
+
+`sharedArtifactWriteMode: "advisory"` lets a changed or previously unreviewed shared-system write proceed after findings or reviewer unavailability with a visible warning. Existing configurations that omit this field resolve to `enforce`; the release example opts into `advisory` explicitly. Deterministic credential detection remains blocking. Advisory mode is not an authorization mechanism: it assumes that the host agent or a separate policy gate enforces explicit current-turn action and target authorization. Use `"enforce"` when reviewer findings and unavailability must block the write.
 
 ## Scope and concurrency
 
@@ -74,9 +80,9 @@ The extension cannot lock files across processes or prove line ownership inside 
 
 ## Availability and residual risk
 
-Malformed configuration, unsupported CLI versions, authentication failure, timeouts, oversized output, secret detection, mixed Git state, and bundle errors produce an explicit no-PASS state. General reviewer unavailability releases the primary response with a warning rather than silently discarding it. Confirmed blocking findings are stricter: correction-delivery failure or exhaustion of the automatic budget withholds the draft until an explicit same-generation manual release.
+Malformed configuration, unsupported CLI versions, authentication failure, timeouts, oversized output, secret detection, mixed Git state, and bundle errors produce an explicit no-PASS state. General reviewer unavailability releases the primary response with a warning rather than silently discarding it. For repository delivery, confirmed blocking findings are stricter: correction-delivery failure or exhaustion of the automatic budget withholds the draft until an explicit same-generation manual release.
 
-`Critical` and `High` findings block by default. `Medium` is advisory unless configured as blocking. A user can pause or bypass review, but the resulting delivery states visibly that it has no Claude PASS.
+`Critical` and `High` findings block repository delivery by default. `Medium` is advisory unless configured as blocking. Shared-system writes follow `sharedArtifactWriteMode`; explicitly configured advisory mode does not let reviewer opinion or availability override a separately authorized write, while deterministic credential checks remain blocking. A user can pause or bypass repository review, but the resulting delivery states visibly that it has no Claude PASS.
 
 The circuit breaker stops repeated reviewer failures after the configured task-local threshold. Manual and automatic attempt budgets are separate. The default automatic budget is two reviews, which permits one correction loop.
 

@@ -12,12 +12,14 @@ This is an independent project. It is not affiliated with or endorsed by Anthrop
 - Reviews broad changes and configurable documentation or product artifacts.
 - Holds qualifying final responses behind a `message_end` delivery gate.
 - Returns blocking findings privately to the primary agent for correction, then reviews the corrected state again.
-- Treats `Critical` and `High` findings as blocking by default. `Medium` findings are advisory unless configured otherwise.
+- Treats `Critical` and `High` findings as blocking for repository delivery by default. The release example makes shared-system write findings advisory; enforcing mode remains available and is used for legacy configurations without an explicit mode.
 - Keeps manual review attempts separate from automatic delivery-gate attempts.
 - Stops repeated reviewer failures with a task-local circuit breaker.
 - Runs Claude without tools or session persistence, with a minimal environment and an empty temporary working directory.
 
-Shared-system pre-write review evaluates the current mutation, not an impossible atomic representation of a multi-step workflow. When a later write depends on an identifier created by the current write, the first mutation can proceed after its own review. For example, Jira issue creation is reviewed and executed before a separate issue-link call uses the generated key. Evidence metadata for shared-system reviews remains available across follow-up turns in the same Pi session. `Medium` findings are advisory by default for shared-system writes, matching the file-review severity policy. Exact-target read-back remains required after the writes.
+Shared-system review evaluates the current mutation, not an impossible atomic representation of a multi-step workflow. When `claude_review` receives an exact draft snapshot with matching `system`, `action`, `target`, and canonical JSON `content`, a `PASS` is cached for the Pi session. A later identical Jira or Confluence write reuses that review instead of calling Claude again. Changed or previously unreviewed payloads receive a pre-write review.
+
+`sharedArtifactWriteMode` controls that pre-write result. The release example selects `advisory`, which lets the explicitly requested write proceed with a visible finding or no-PASS warning; deterministic credential checks still block. This mode assumes that the host agent or a separate policy gate enforces current-turn write authorization. `enforce` retains fail-closed blocking for configured severities and reviewer unavailability. When a later write depends on an identifier created by the current write, the first mutation can proceed before a separate issue-link call uses the generated key. Exact-target read-back remains required after every successful write.
 
 A Claude `PASS` is evidence from a bounded second model, not proof of correctness. Exact-target verification remains required.
 
@@ -65,10 +67,10 @@ claude auth status
 Install the tagged release:
 
 ```bash
-pi install git:github.com/NOWArocks/adaptive-claude-review@v0.1.1
+pi install git:github.com/NOWArocks/adaptive-claude-review@v0.2.0
 mkdir -p ~/.pi/agent
 test ! -e ~/.pi/agent/claude-review.json && \
-  curl -fsSL https://raw.githubusercontent.com/NOWArocks/adaptive-claude-review/v0.1.1/claude-review.example.json \
+  curl -fsSL https://raw.githubusercontent.com/NOWArocks/adaptive-claude-review/v0.2.0/claude-review.example.json \
   -o ~/.pi/agent/claude-review.json
 ```
 
@@ -105,7 +107,7 @@ Pi reads only the user-owned global configuration:
 
 The extension does not load project-local configuration. This prevents an untrusted repository from changing the reviewer command, outbound scope, or privacy controls.
 
-Malformed JSON produces a visible `config error` state and disables review. Unknown keys appear as warnings. `~` in `allowedRoots` is expanded, and paths are canonicalized through existing symlinks.
+Malformed JSON produces a visible `config error` state and disables repository review; shared-system writes then fail closed. Unknown keys and a missing `sharedArtifactWriteMode` appear as warnings. Existing configurations without the new field preserve prior behavior as `enforce`; the new example explicitly selects `advisory`. An invalid write-mode value also resolves to `enforce`. `~` in `allowedRoots` is expanded, and paths are canonicalized through existing symlinks.
 
 | Field | Purpose | Default |
 | --- | --- | --- |
@@ -116,10 +118,12 @@ Malformed JSON produces a visible `config error` state and disables review. Unkn
 | `effort` | Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, or `max`. | `medium` |
 | `maxAutomaticReviewsPerTask` | Delivery-gate attempt budget. The default permits the initial review and one post-correction review. | `2` |
 | `maxManualReviewsPerTask` | Explicit tool-call attempt budget. | `3` |
+| `maxSharedArtifactReviewsPerTask` | Automatic Jira and Confluence pre-write review budget per task. | `20` |
 | `maxConsecutiveFailures` | Failures before the task-local circuit opens. | `2` |
 | `timeoutMs` | Reviewer-process timeout, bounded to 30–300 seconds. | `90000` |
 | `bundleTimeoutMs` | Aggregate bundle-construction deadline. | `30000` |
-| `blockingSeverities` | Findings that hold the draft. | `Critical`, `High` |
+| `blockingSeverities` | Findings that hold repository delivery and enforcing shared-system writes. | `Critical`, `High` |
+| `sharedArtifactWriteMode` | Shared-system write policy: `advisory` allows findings and reviewer unavailability with a warning; `enforce` blocks configured severities and unavailability. Credential detection always blocks. | `enforce` (release example: `advisory`) |
 | `showOutboundNotice` | Shows a notice before the session's first outbound review. | `true` |
 | `maxTaskContextPrompts` | Current request plus bounded earlier messages. | `6` |
 | `reviewDocumentation` | Reviews documentation and product artifacts deterministically. | `false` |
@@ -134,6 +138,23 @@ Malformed JSON produces a visible `config error` state and disables review. Unkn
 | `reviewProfiles.figjam` | Extra criteria for paths under a `FigJam` directory. | `[]` |
 
 Keep organization-specific rules in the installed configuration, not in a reusable repository.
+
+### Reusable shared-artifact reviews
+
+For a Jira or Confluence draft that will be written after user approval, call `claude_review` with exactly one artifact containing the exact future mutation. Multi-artifact review results are not split into independently reusable approvals:
+
+```json
+{
+  "artifacts": [{
+    "system": "Jira",
+    "action": "create issue",
+    "target": "WKW: Implement survey",
+    "content": "{\"projectKey\":\"WKW\",\"issueTypeName\":\"Task\",\"summary\":\"Implement survey\",\"description\":\"Acceptance criteria\"}"
+  }]
+}
+```
+
+The extension canonicalizes valid JSON before fingerprinting it, so object key order and whitespace do not matter. System, action, target, JSON values, and nested array order must match the later tool call. A matching `PASS` is reused only in the same Pi session. Successful create and add actions consume the cached PASS so an identical duplicate creation is reviewed again; field-replacing Jira edits and idempotent Confluence/comment updates can retain it. Jira edits with append-style `update` operations consume the PASS. A changed payload is reviewed again under `sharedArtifactWriteMode`.
 
 ## Outbound data and privacy
 
@@ -150,7 +171,7 @@ A bundle can contain:
 - explicitly configured related files;
 - discovered topic files only when `discoverTopicContext` is `true`.
 
-Every bundle contains an exact-path manifest for included files. Protected and denied paths appear only as a count; their names and content are withheld. Topic discovery is off by default. When enabled, related context is limited to 30 files, 25,000 characters total, and 15,000 bytes per file. Diffs use three context lines and are capped at 25,000 characters; current changed-file content is capped at 55,000 characters total.
+Every bundle contains an exact-path manifest for included files. Protected and denied paths appear only as a count; their names, content, and evidence metadata are withheld. Topic discovery is off by default. When enabled, related context is limited to 30 files, 25,000 characters total, and 15,000 bytes per file. Diffs use three context lines and are capped at 25,000 characters; current changed-file content is capped at 55,000 characters total.
 
 Credential detection is heuristic, not complete. The extension blocks high-confidence private keys, provider tokens, JWTs, credential-bearing URLs, and literal secret assignments. It also blocks standard credential paths, Terraform variable files, application configuration files, and configured `deniedPaths`. It cannot guarantee detection of every credential, PII value, or encoded secret. Configure sensitive directories in `deniedPaths`; do not rely on pattern detection alone.
 
@@ -165,7 +186,7 @@ See [SECURITY.md](SECURITY.md) for the complete boundary and residual risks.
 
 ## Evidence metadata
 
-The bounded task-local ledger records observed source access and recognized verification commands. Shared-system reviews also use a bounded session ledger so follow-up write requests retain source-access metadata from earlier turns. Neither ledger turns observations into proof.
+The bounded task-local ledger records observed source access and recognized verification commands. Shared-system reviews also use a bounded session ledger so follow-up write requests retain source-access metadata from earlier turns. Exact passed shared-artifact snapshots remain cached only for the current Pi session. Neither ledger nor a cached PASS turns observations into proof.
 
 A command is recognized only when it appears to execute a real test, build, lint, typecheck, or verify action. Help, version, dry-run, collect-only, piped, and failure-masked commands are not recorded as successful checks. Ledger output uses `OBSERVED SUCCESS`, not `PASS`, because tool success does not prove the exact product claim.
 
@@ -205,7 +226,7 @@ Reviewer output and withheld drafts are wrapped in fresh random untrusted-data b
 - `last` shows the latest outcome, scope, trigger reasons, duration, review-input size, attempts, bounded findings, session outcome counts, and session p95 review latency. For `unavailable`, the first reason identifies the timeout, malformed output, bundle, authentication, configuration, or delivery failure that caused that occurrence.
 - `last draft` additionally retrieves the bounded withheld draft from extension memory.
 - `release` deliberately releases the exact bounded draft held after unresolved blocking findings exhaust the automatic budget. A reason is required, the command works once and only in the same task generation, and the released text starts with a visible no-PASS disclosure. The release is recorded in the local Pi session when persistence is available.
-- `pause` releases changed turns with a visible ungated warning.
+- `pause` releases changed repository turns with a visible ungated warning. Shared-system writes continue under `sharedArtifactWriteMode`; deterministic credential checks still block.
 - `resume` resets the failure circuit and clears timeout retry blocks, but preserves the current task baseline and scope.
 - `skip` bypasses one changed delivery and adds a visible no-PASS disclosure.
 

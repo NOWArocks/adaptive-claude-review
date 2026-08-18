@@ -583,7 +583,7 @@ export type ReviewSeverity = "Critical" | "High" | "Medium";
 
 export function reviewFindingSeverities(output: string): ReviewSeverity[] {
   const severities = new Set<ReviewSeverity>();
-  for (const match of output.matchAll(/^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(?:\*\*)?(Critical|High|Medium)(?:\*\*)?\s*(?::|[-–—])/gim)) {
+  for (const match of output.matchAll(/^\s*(?:(?:[-*]|\d+[.)])\s*)?(?:#{1,6}\s*)?(?:\*\*)?(Critical|High|Medium)(?:\*\*)?(?:\s*[:–—]\s*|\s+-+\s+|-\s+)/gim)) {
     const severity = `${match[1][0].toUpperCase()}${match[1].slice(1).toLowerCase()}` as ReviewSeverity;
     severities.add(severity);
   }

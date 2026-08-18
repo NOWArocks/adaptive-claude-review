@@ -82,6 +82,9 @@ describe("sharedArtifactFromToolCall", () => {
     expect(sharedArtifactFromToolCall("mcp_http_atlassian_editjiraissue", {
       arguments: { issueIdOrKey: "WKW-1", fields: { parent: { key: "WKW-2" } } },
     })?.content).toContain("WKW-2");
+    expect(sharedArtifactFromToolCall("mcp_http_atlassian_editjiraissue", {
+      arguments: { issueIdOrKey: "WKW-1", update: { comment: [{ add: { body: "One-time note" } }] } },
+    })?.content).toContain("One-time note");
     expect(sharedArtifactFromToolCall("mcp_http_atlassian_createissuelink", {
       arguments: { inwardIssue: "WKW-1", outwardIssue: "WKW-2", type: "Relates" },
     })).toBeUndefined();
@@ -960,7 +963,15 @@ describe("review safety and result parsing", () => {
     expect(parseReviewVerdict("I could not review this bundle.")).toBe("unknown");
     expect(reviewFindingSeverities("- Critical: loss\nMedium: test gap")).toEqual(["Critical", "Medium"]);
     expect(reviewFindingSeverities("**Critical — authorization bypass**\n### High: data loss\n- **Medium** - missing retry test")).toEqual(["Critical", "High", "Medium"]);
+    expect(reviewFindingSeverities("1. **High — broken workflow**\n2) Medium: missing edge case")).toEqual(["High", "Medium"]);
+    expect(parseReviewVerdict("VERDICT: FINDINGS\n1. **High — broken workflow**")).toBe("findings");
     expect(parseReviewVerdict("VERDICT: FINDINGS\n**Critical — authorization bypass**")).toBe("findings");
+    expect(parseReviewVerdict("VERDICT: FINDINGS\n**Critical—authorization bypass**")).toBe("findings");
+    expect(parseReviewVerdict("VERDICT: PASS\n1. High-level design is sound.\n2) Critical-path tests exist.\n3. Critical -path wording is literal.")).toBe("pass");
+    expect(parseReviewVerdict("VERDICT: PASS\nHigh—authorization bypass")).toBe("unknown");
+    expect(parseReviewVerdict("VERDICT: PASS\nHigh- data loss")).toBe("unknown");
+    expect(parseReviewVerdict("VERDICT: PASS\nHigh : credential leak")).toBe("unknown");
+    expect(parseReviewVerdict("VERDICT: PASS\nCritical -- data loss")).toBe("unknown");
   });
 
   test("accepts only an exact leading pass verdict without severity findings", () => {
