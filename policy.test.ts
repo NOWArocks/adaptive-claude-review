@@ -53,6 +53,13 @@ const modified = (path: string, addedLines: number, deletedLines = 0) => ({
   kind: "modified" as const,
 });
 
+const added = (path: string, addedLines: number) => ({
+  path,
+  addedLines,
+  deletedLines: 0,
+  kind: "added" as const,
+});
+
 describe("sharedArtifactFromToolCall", () => {
   test("extracts nested Jira issue creation content", () => {
     const artifact = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", {
@@ -212,6 +219,12 @@ describe("classifyReview", () => {
     const decision = classifyReview([modified("package-lock.json", 900, 850)]);
     expect(decision.review).toBe(false);
     expect(decision.reasons).toEqual(["lockfile-only change"]);
+  });
+
+  test("classifies Node module variants as source files", () => {
+    for (const path of ["extensions/workflow.mjs", "config/runtime.cjs"]) {
+      expect(classifyReview([added(path, 8)]).reasons).toContain("new source file added");
+    }
   });
 
   test("removes control characters from changed paths used in review reasons", () => {
@@ -913,6 +926,8 @@ describe("task-local review evidence", () => {
 
   test("sends text files but excludes binary artifacts from changed-file content", () => {
     expect(isReviewTextPath("FigJam/build-board.ts")).toBe(true);
+    expect(isReviewTextPath("extensions/workflow.mjs")).toBe(true);
+    expect(isReviewTextPath("config/runtime.cjs")).toBe(true);
     expect(isReviewTextPath("FigJam/board.html")).toBe(true);
     expect(isReviewTextPath("FigJam/final-board.png")).toBe(false);
     expect(isReviewTextPath("attachments/source.pdf")).toBe(false);

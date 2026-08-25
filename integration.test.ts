@@ -338,6 +338,18 @@ describe("extension lifecycle", () => {
     });
   });
 
+  test("includes changed MJS module content in an automatic high-risk review bundle", async () => {
+    let reviewInput = "";
+    await withHarness(async (_config, input) => { reviewInput = input; return "VERDICT: PASS\nMJS authorization guard reviewed."; }, async (h) => {
+      await h.start("Harden the authorization extension");
+      await h.mutate("src/auth/guard.mjs", "export const authorize = (allowed) => allowed === true;\n");
+      expect(await h.finish()).toBeUndefined();
+      expect(reviewInput).toContain("src/auth/guard.mjs");
+      expect(reviewInput).toContain("export const authorize = (allowed) => allowed === true;");
+      expect(reviewInput).not.toContain("not a regular text-sized file");
+    });
+  });
+
   test("gates an explicit-only Bash scope even when no streaming display flag was set", async () => {
     let calls = 0;
     await withHarness(async () => { calls++; return "VERDICT: PASS\nExplicit scope reviewed."; }, async (h) => {
