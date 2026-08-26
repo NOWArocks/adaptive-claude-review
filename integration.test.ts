@@ -311,36 +311,30 @@ describe("extension lifecycle", () => {
     });
   });
 
-  test("runs one initial and one final review, then releases the corrected state without a third", async () => {
-    let calls = 0;
-    await withHarness(async () => {
-      calls++;
-      return "VERDICT: FINDINGS\nHigh: unresolved authorization bypass";
-    }, async (h) => {
+  test("runs a final third review after two correction rounds", async () => {
+    const outputs = [
+      "VERDICT: FINDINGS\nHigh: unresolved authorization bypass",
+      "VERDICT: FINDINGS\nHigh: verification is incomplete",
+      "VERDICT: PASS\nAuthorization and verification are complete.",
+    ];
+    await withHarness(async () => outputs.shift()!, async (h) => {
       await h.start();
       await h.mutate("src/auth/session.ts", "export const secure = true;\n");
       expect(warningText(await h.finish("First draft"))).toContain("correcting them before delivery");
       expect(h.messages).toHaveLength(1);
 
       await h.mutate("src/auth/session.ts", "export const secure = true;\nexport const checked = true;\n", "edit");
-      expect(warningText(await h.finish("Final-review draft"))).toContain("correcting them before delivery");
-      expect(calls).toBe(2);
+      expect(warningText(await h.finish("Second draft"))).toContain("correcting them before delivery");
       expect(h.messages).toHaveLength(2);
 
       await h.mutate("src/auth/session.ts", "export const secure = true;\nexport const checked = true;\nexport const verified = true;\n", "edit");
-      const released = await h.finish("Corrected after final findings");
-      expect(warningText(released)).toContain("hard limit of 2 Claude reviews was reached");
-      expect(warningText(released)).toContain("no Claude PASS");
-      expect(warningText(released)).toContain("Corrected after final findings");
-      expect(calls).toBe(2);
-
-      await h.command("claude-review-last");
-      expect(h.notifications.at(-1)?.message).toContain("Status: unavailable");
-      expect(h.notifications.at(-1)?.message).toContain("hard limit of 2");
-    }, "rpc", { maxAutomaticReviewsPerTask: 2 });
+      expect(await h.finish("Final reviewed draft")).toBeUndefined();
+      expect(outputs).toHaveLength(0);
+      expect(h.notifications.some((entry) => entry.message.includes("Automatic Claude review passed"))).toBe(true);
+    }, "rpc", { maxAutomaticReviewsPerTask: 3 });
   });
 
-  test("applies the same two-review cap across manual and delivery-gate reviews", async () => {
+  test("applies the same three-review cap across manual and delivery-gate reviews", async () => {
     let calls = 0;
     await withHarness(async () => {
       calls++;
@@ -353,15 +347,19 @@ describe("extension lifecycle", () => {
       expect(warningText(await h.finish("First manual draft"))).toContain("correcting them before delivery");
 
       await h.mutate("src/auth/session.ts", "export const secure = true;\nexport const checked = true;\n", "edit");
-      await tool.execute("manual-findings-2", { rationale: "Final review of corrected auth", paths: ["src/auth/session.ts"] }, undefined, undefined, h.ctx);
-      expect(warningText(await h.finish("Final manual-review draft"))).toContain("correcting them before delivery");
+      await tool.execute("manual-findings-2", { rationale: "Review corrected auth", paths: ["src/auth/session.ts"] }, undefined, undefined, h.ctx);
+      expect(warningText(await h.finish("Second manual-review draft"))).toContain("correcting them before delivery");
 
       await h.mutate("src/auth/session.ts", "export const secure = true;\nexport const checked = true;\nexport const verified = true;\n", "edit");
-      const released = await h.finish("Corrected after manual final findings");
-      expect(warningText(released)).toContain("hard limit of 2 Claude reviews was reached");
-      expect(calls).toBe(2);
-      await expect(tool.execute("manual-findings-3", { rationale: "Forbidden third review", paths: ["src/auth/session.ts"] }, undefined, undefined, h.ctx)).rejects.toThrow("hard limit of 2");
-    }, "rpc", { maxAutomaticReviewsPerTask: 2 });
+      await tool.execute("manual-findings-3", { rationale: "Final review of corrected auth", paths: ["src/auth/session.ts"] }, undefined, undefined, h.ctx);
+      expect(warningText(await h.finish("Final manual-review draft"))).toContain("correcting them before delivery");
+
+      await h.mutate("src/auth/session.ts", "export const secure = true;\nexport const checked = true;\nexport const verified = true;\nexport const final = true;\n", "edit");
+      const released = await h.finish("Corrected after final findings");
+      expect(warningText(released)).toContain("hard limit of 3 Claude reviews was reached");
+      expect(calls).toBe(3);
+      await expect(tool.execute("manual-findings-4", { rationale: "Forbidden fourth review", paths: ["src/auth/session.ts"] }, undefined, undefined, h.ctx)).rejects.toThrow("hard limit of 3");
+    }, "rpc", { maxAutomaticReviewsPerTask: 3 });
   });
 
   test("counts and blocks direct Claude CLI review invocations", async () => {
@@ -370,11 +368,43 @@ describe("extension lifecycle", () => {
       const first = await h.emit("tool_call", { type: "tool_call", toolCallId: "direct-review-1", toolName: "bash", input: { command: "fake-claude -p 'review this diff'" } });
       const second = await h.emit("tool_call", { type: "tool_call", toolCallId: "direct-review-2", toolName: "bash", input: { command: "env NO_COLOR=1 fake-claude --print 'final review'" } });
       const third = await h.emit("tool_call", { type: "tool_call", toolCallId: "direct-review-3", toolName: "bash", input: { command: "fake-claude -p 'review again'" } });
+      const fourth = await h.emit("tool_call", { type: "tool_call", toolCallId: "direct-review-4", toolName: "bash", input: { command: "fake-claude -p 'forbidden fourth review'" } });
       expect(first).toBeUndefined();
       expect(second).toBeUndefined();
-      expect(third.block).toBe(true);
-      expect(third.reason).toContain("hard limit of 2");
-      expect(h.notifications.filter((entry) => entry.message.includes("consumed a delivery-cycle review slot"))).toHaveLength(2);
+      expect(third).toBeUndefined();
+      expect(fourth.block).toBe(true);
+      expect(fourth.reason).toContain("hard limit of 3");
+      expect(h.notifications.filter((entry) => entry.message.includes("consumed a delivery-cycle review slot"))).toHaveLength(3);
+    });
+  });
+
+  test("starts a separate review cycle for a new explicit idle user request", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return "VERDICT: FINDINGS\nHigh: unresolved review finding";
+    }, async (h) => {
+      await h.start("Review the authentication change");
+      writeFileSync(join(h.root, "generated.ts"), "export const generated = 2;\n");
+      const tool = h.tools.get("claude_review");
+      await tool.execute("first-cycle-1", { rationale: "Context A", paths: ["generated.ts"] }, undefined, undefined, h.ctx);
+      await tool.execute("first-cycle-2", { rationale: "Context B", paths: ["generated.ts"] }, undefined, undefined, h.ctx);
+      await tool.execute("first-cycle-3", { rationale: "Context C", paths: ["generated.ts"] }, undefined, undefined, h.ctx);
+      expect(calls).toBe(3);
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Internal correction context", source: "extension" });
+      h.setIdle(false);
+      await expect(tool.execute("first-cycle-4", { rationale: "Context D", paths: ["generated.ts"] }, undefined, undefined, h.ctx)).rejects.toThrow("hard limit of 3");
+
+      h.setIdle(true);
+      await h.emit("input", { type: "input", text: "Review an unrelated formatting change", source: "rpc" });
+      h.setIdle(false);
+      await h.mutate("src/format.ts", "export const format = 2;\n");
+      await tool.execute("second-cycle-1", { rationale: "Unrelated formatting delivery", paths: ["src/format.ts"] }, undefined, undefined, h.ctx);
+      expect(calls).toBe(4);
+      await h.command("claude-review-status");
+      expect(h.notifications.at(-1)?.message).toContain("total 1/3 hard cap");
     });
   });
 
@@ -600,7 +630,7 @@ describe("extension lifecycle", () => {
       await h.mutate("src/auth/session.ts", "export const secure = true;\nexport const retry = 1;\n");
       expect(warningText(await h.finish())).toContain("review timeout");
       await h.mutate("src/auth/session.ts", "export const secure = true;\nexport const retry = 2;\n");
-      expect(warningText(await h.finish())).toContain("hard limit of 2 Claude reviews");
+      expect(warningText(await h.finish())).toContain("reviewer circuit breaker is open");
       expect(h.notifications.some((entry) => entry.message.includes("passed"))).toBe(false);
     });
   });
@@ -702,10 +732,10 @@ describe("extension lifecycle", () => {
       const tool = h.tools.get("claude_review");
       await tool.execute("context-a", { rationale: "Context A", paths: ["generated.ts"] }, undefined, undefined, h.ctx);
       await tool.execute("context-b", { rationale: "Context B", paths: ["generated.ts"] }, undefined, undefined, h.ctx);
-      await expect(tool.execute("context-a-again", { rationale: "Context A", paths: ["generated.ts"] }, undefined, undefined, h.ctx)).rejects.toThrow("hard limit of 2");
+      await expect(tool.execute("context-a-again", { rationale: "Context A", paths: ["generated.ts"] }, undefined, undefined, h.ctx)).rejects.toThrow("already reviewed");
       expect(calls).toBe(2);
       await h.command("claude-review-status");
-      expect(h.notifications.at(-1)?.message).toContain("total 2/2 hard cap");
+      expect(h.notifications.at(-1)?.message).toContain("total 2/3 hard cap");
     });
   });
 
@@ -743,10 +773,11 @@ describe("extension lifecycle", () => {
     });
   });
 
-  test("queues final-review findings once and then releases without a third review", async () => {
+  test("queues third-review findings once and then releases without a fourth review", async () => {
     const outputs = [
       "VERDICT: FINDINGS\nHigh: first evidence gap",
       "VERDICT: FINDINGS\nHigh: second evidence gap",
+      "VERDICT: FINDINGS\nHigh: final evidence gap",
     ];
     await withHarness(async () => outputs.shift()!, async (h) => {
       await h.start();
@@ -772,7 +803,20 @@ describe("extension lifecycle", () => {
         isError: false,
         content: [{ type: "text", text: "typecheck passed" }],
       });
-      expect(warningText(await h.finish("Final draft"))).toContain("hard limit of 2 Claude reviews");
+      expect(warningText(await h.finish("Third-review draft"))).toContain("correcting them before delivery");
+      expect(h.messages).toHaveLength(3);
+
+      await h.emit("tool_result", {
+        type: "tool_result",
+        toolCallId: "final-context-check",
+        toolName: "bash",
+        input: { command: "bun run verify" },
+        isError: false,
+        content: [{ type: "text", text: "verify passed" }],
+      });
+      const released = warningText(await h.finish("Corrected after final findings"));
+      expect(released).toContain("hard limit of 3 Claude reviews");
+      expect(released).toContain("no fourth review");
       expect(outputs).toHaveLength(0);
     }, "rpc", { maxAutomaticReviewsPerTask: 3 });
   });
@@ -925,9 +969,9 @@ describe("extension lifecycle", () => {
       for (const [index, [toolCallId, toolName, input]] of cases.entries()) {
         expect(await h.emit("tool_call", { type: "tool_call", toolCallId, toolName, input })).toBeUndefined();
         const result = await h.emit("tool_result", { type: "tool_result", toolCallId, toolName, input, isError: false, content: [] });
-        expect(result.content.at(-1).text).toContain(index < 2 ? "pre-write review passed" : "no Claude PASS");
+        expect(result.content.at(-1).text).toContain(index < 3 ? "pre-write review passed" : "no Claude PASS");
       }
-      expect(calls).toBe(2);
+      expect(calls).toBe(3);
     });
   });
 
@@ -966,7 +1010,7 @@ describe("extension lifecycle", () => {
       await h.emit("tool_result", { type: "tool_result", toolCallId: "jira-concurrent-create", toolName: "mcp_http_atlassian_createjiraissue", input, isError: false, content: [] });
 
       expect(await h.emit("tool_call", { type: "tool_call", toolCallId: "jira-repeat-create", toolName: "mcp_http_atlassian_createjiraissue", input })).toBeUndefined();
-      expect(calls).toBe(2);
+      expect(calls).toBe(3);
     });
   });
 
@@ -1361,7 +1405,7 @@ describe("configuration diagnostics", () => {
       writeFileSync(path, JSON.stringify({ enabled: true, allowedRoots: ["~/projects"], mystery: true }));
       const loaded = loadConfigFile(path);
       expect(loaded.config.allowedRoots[0]).not.toContain("~");
-      expect(loaded.config.maxAutomaticReviewsPerTask).toBe(2);
+      expect(loaded.config.maxAutomaticReviewsPerTask).toBe(3);
       expect(loaded.config.timeoutMs).toBe(90_000);
       expect(loaded.config.sharedArtifactWriteMode).toBe("enforce");
       expect(loaded.warnings).toContain("sharedArtifactWriteMode is not set; preserving the prior fail-closed behavior with enforce. Set it explicitly to advisory or enforce.");
