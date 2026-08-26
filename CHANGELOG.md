@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Check Claude CLI version and authentication asynchronously at each in-scope Pi session start, and show a recovery warning without delaying startup when review readiness is unavailable.
 - Enforce one hard two-invocation cap across automatic, manual, shared-artifact, and recognized direct Claude CLI reviews in each delivery cycle.
 - Permit a final correction after second-review findings, then release with deterministic-verification and no-PASS disclosure instead of running or requesting a third review.
 - Carry the cap across follow-up turns until delivery or a successful shared-system write completes.

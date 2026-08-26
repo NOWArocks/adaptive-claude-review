@@ -58,6 +58,7 @@ function createHarness(reviewer: Reviewer, mode = "rpc" as "rpc" | "tui" | "json
   let sessionId = "session-1";
   let throwOnSend = false;
   let throwOnAppend = false;
+  let resolvePendingClaudeAuth: ((result: { stdout: string; stderr: string; code: number; killed: boolean }) => void) | undefined;
 
   const pi: any = {
     on(name: string, handler: any) {
@@ -75,8 +76,28 @@ function createHarness(reviewer: Reviewer, mode = "rpc" as "rpc" | "tui" | "json
       messages.push({ message, options });
     },
     async exec(command: string, args: string[], options: { cwd?: string } = {}) {
-      if (command === "fake-claude" && args[0] === "--version") return { stdout: "2.1.226\n", stderr: "", code: 0, killed: false };
-      if (command === "fake-claude" && args[0] === "auth") return { stdout: JSON.stringify({ loggedIn: true, subscriptionType: "test" }), stderr: "", code: 0, killed: false };
+      if ((command === "fake-claude" || command === "fake-claude-logged-out" || command === "fake-claude-auth-error" || command === "fake-claude-pending") && args[0] === "--version") {
+        return { stdout: "2.1.226\n", stderr: "", code: 0, killed: false };
+      }
+      if (command === "fake-claude-outdated" && args[0] === "--version") {
+        return { stdout: "2.1.100\n", stderr: "", code: 0, killed: false };
+      }
+      if (command === "fake-claude-error") throw new Error("spawn failed");
+      if (command === "fake-claude" && args[0] === "auth") {
+        return { stdout: JSON.stringify({ loggedIn: true, subscriptionType: "test" }), stderr: "", code: 0, killed: false };
+      }
+      if (command === "fake-claude-logged-out" && args[0] === "auth") {
+        return { stdout: JSON.stringify({ loggedIn: false, authMethod: "none" }), stderr: "", code: 1, killed: false };
+      }
+      if (command === "fake-claude-outdated" && args[0] === "auth") {
+        return { stdout: JSON.stringify({ loggedIn: true, authMethod: "claude.ai" }), stderr: "", code: 0, killed: false };
+      }
+      if (command === "fake-claude-auth-error" && args[0] === "auth") {
+        return { stdout: "", stderr: "keychain read failed", code: 1, killed: false };
+      }
+      if (command === "fake-claude-pending" && args[0] === "auth") {
+        return await new Promise((resolve) => { resolvePendingClaudeAuth = resolve; });
+      }
       const result = spawnSync(command, args, { cwd: options.cwd, encoding: "utf8" });
       return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1, killed: false };
     },
@@ -138,6 +159,14 @@ function createHarness(reviewer: Reviewer, mode = "rpc" as "rpc" | "tui" | "json
     setSession(value: string) { sessionId = value; },
     setThrowOnSend(value: boolean) { throwOnSend = value; },
     setThrowOnAppend(value: boolean) { throwOnAppend = value; },
+    resolveClaudeAuth(loggedIn: boolean) {
+      resolvePendingClaudeAuth?.({
+        stdout: JSON.stringify({ loggedIn, authMethod: loggedIn ? "claude.ai" : "none" }),
+        stderr: "",
+        code: loggedIn ? 0 : 1,
+        killed: false,
+      });
+    },
     cleanup() { rmSync(root, { recursive: true, force: true }); },
   };
 }
@@ -152,6 +181,78 @@ function warningText(result: any): string {
 }
 
 describe("extension lifecycle", () => {
+  test("checks Claude readiness in the background and stays silent when authentication is available", async () => {
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.emit("session_start", { type: "session_start", reason: "startup" });
+      await Bun.sleep(0);
+      expect(h.notifications.some((entry) => entry.message.includes("Claude review will be unavailable"))).toBe(false);
+    });
+  });
+
+  test("warns at session start when Claude authentication is unavailable", async () => {
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.emit("session_start", { type: "session_start", reason: "startup" });
+      await Bun.sleep(0);
+      expect(h.notifications.some((entry) => entry.message.includes("Claude review will be unavailable"))).toBe(true);
+      expect(h.notifications.some((entry) => entry.message.includes("claude auth login"))).toBe(true);
+    }, "rpc", { claudeCommand: "fake-claude-logged-out" });
+  });
+
+  test("gives upgrade guidance instead of login guidance for an outdated Claude CLI", async () => {
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.emit("session_start", { type: "session_start", reason: "startup" });
+      await Bun.sleep(0);
+      const warning = h.notifications.find((entry) => entry.message.includes("Claude review will be unavailable"))?.message ?? "";
+      expect(warning).toContain("Install or upgrade the Claude CLI");
+      expect(warning).not.toContain("claude auth login");
+    }, "rpc", { claudeCommand: "fake-claude-outdated" });
+  });
+
+  test("gives diagnostic guidance when auth status exits nonzero without confirming logout", async () => {
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.emit("session_start", { type: "session_start", reason: "startup" });
+      await Bun.sleep(0);
+      const warning = h.notifications.find((entry) => entry.message.includes("Claude review will be unavailable"))?.message ?? "";
+      expect(warning).toContain("keychain read failed");
+      expect(warning).toContain("/claude-review-status");
+      expect(warning).not.toContain("claude auth login");
+    }, "rpc", { claudeCommand: "fake-claude-auth-error" });
+  });
+
+  test("gives diagnostic guidance when the readiness command fails unexpectedly", async () => {
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.emit("session_start", { type: "session_start", reason: "startup" });
+      await Bun.sleep(0);
+      const warning = h.notifications.find((entry) => entry.message.includes("readiness check failed"))?.message ?? "";
+      expect(warning).toContain("/claude-review-status");
+      expect(warning).not.toContain("claude auth login");
+    }, "rpc", { claudeCommand: "fake-claude-error" });
+  });
+
+  test("does not delay session startup while the Claude readiness check is pending", async () => {
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      const startup = h.emit("session_start", { type: "session_start", reason: "startup" });
+      const outcome = await Promise.race([
+        startup.then(() => "started"),
+        Bun.sleep(100).then(() => "blocked"),
+      ]);
+      expect(outcome).toBe("started");
+      h.resolveClaudeAuth(false);
+      await Bun.sleep(0);
+      expect(h.notifications.some((entry) => entry.message.includes("Claude review will be unavailable"))).toBe(true);
+    }, "rpc", { claudeCommand: "fake-claude-pending" });
+  });
+
+  test("suppresses a stale readiness warning after the active session changes", async () => {
+    await withHarness(async () => "VERDICT: PASS\nUnused", async (h) => {
+      await h.emit("session_start", { type: "session_start", reason: "startup" });
+      h.setSession("session-2");
+      h.resolveClaudeAuth(false);
+      await Bun.sleep(0);
+      expect(h.notifications.some((entry) => entry.message.includes("Claude review will be unavailable"))).toBe(false);
+    }, "rpc", { claudeCommand: "fake-claude-pending" });
+  });
+
   test("releases a low-risk change without invoking Claude and records the skip", async () => {
     let calls = 0;
     await withHarness(async () => { calls++; return "VERDICT: PASS\nUnused"; }, async (h) => {

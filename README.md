@@ -16,6 +16,7 @@ This is an independent project. It is not affiliated with or endorsed by Anthrop
 - Enforces one hard two-invocation cap across manual, automatic, shared-artifact, and direct Claude CLI reviews in each delivery cycle.
 - Stops repeated reviewer failures with a task-local circuit breaker.
 - Runs Claude without tools or session persistence, with a minimal environment and an empty temporary working directory.
+- Checks Claude CLI version and authentication asynchronously at each in-scope Pi session start. A missing or expired login produces a visible warning with the recovery command; a healthy check stays silent and never delays session startup.
 
 Shared-system review evaluates the current mutation, not an impossible atomic representation of a multi-step workflow. When `claude_review` receives an exact draft snapshot with matching `system`, `action`, `target`, and canonical JSON `content`, a `PASS` is cached for the Pi session. A later identical Jira or Confluence write reuses that review instead of calling Claude again. Changed or previously unreviewed payloads receive a pre-write review.
 

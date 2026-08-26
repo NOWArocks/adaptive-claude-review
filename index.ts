@@ -1252,7 +1252,9 @@ function versionAtLeast(actual: string, minimum: [number, number, number]): bool
   return true;
 }
 
-async function checkClaudeReadiness(pi: ExtensionAPI, config: Config): Promise<{ ok: boolean; detail: string }> {
+type ClaudeReadiness = { ok: boolean; detail: string; recovery?: string };
+
+async function checkClaudeReadiness(pi: ExtensionAPI, config: Config): Promise<ClaudeReadiness> {
   const cwd = mkdtempSync(join(tmpdir(), "pi-claude-auth-"));
   try {
     const [version, result] = await Promise.all([
@@ -1260,18 +1262,38 @@ async function checkClaudeReadiness(pi: ExtensionAPI, config: Config): Promise<{
       pi.exec(config.claudeCommand, ["auth", "status"], { cwd, timeout: 15_000 }),
     ]);
     if (version.code !== 0 || !versionAtLeast(version.stdout || version.stderr, [2, 1, 226])) {
-      return { ok: false, detail: `Claude CLI 2.1.226 or newer is required; received ${version.stdout.trim() || version.stderr.trim() || "no version"}.` };
+      return {
+        ok: false,
+        detail: `Claude CLI 2.1.226 or newer is required; received ${version.stdout.trim() || version.stderr.trim() || "no version"}.`,
+        recovery: "Install or upgrade the Claude CLI, then restart Pi.",
+      };
     }
-    if (result.code !== 0) return { ok: false, detail: result.stderr.trim() || "Claude authentication check failed." };
+    let status: { loggedIn?: boolean; subscriptionType?: string; orgName?: string } | undefined;
     try {
-      const status = JSON.parse(result.stdout) as { loggedIn?: boolean; subscriptionType?: string; orgName?: string };
-      if (!status.loggedIn) return { ok: false, detail: "Claude CLI is not logged in." };
-      return { ok: true, detail: `${status.subscriptionType ?? "authenticated"}${status.orgName ? ` · ${status.orgName}` : ""} · ${version.stdout.trim()}` };
+      status = JSON.parse(result.stdout) as typeof status;
     } catch {
-      const detail = result.stdout.trim().slice(0, 300);
-      if (/not\s+logged.?in/i.test(result.stdout)) return { ok: false, detail: detail || "Claude CLI is not logged in." };
-      return { ok: /logged.?in/i.test(result.stdout), detail: `${detail} · ${version.stdout.trim()}` };
+      status = undefined;
     }
+    if (status?.loggedIn === false || /not\s+logged.?in/i.test(result.stdout)) return {
+      ok: false,
+      detail: "Claude CLI is not logged in.",
+      recovery: "Run `claude auth login` to restore independent reviews.",
+    };
+    if (result.code !== 0) return {
+      ok: false,
+      detail: result.stderr.trim() || result.stdout.trim().slice(0, 300) || "Claude authentication check failed.",
+      recovery: "Run `/claude-review-status` for detailed diagnostics.",
+    };
+    if (status?.loggedIn) {
+      return { ok: true, detail: `${status.subscriptionType ?? "authenticated"}${status.orgName ? ` · ${status.orgName}` : ""} · ${version.stdout.trim()}` };
+    }
+    const detail = result.stdout.trim().slice(0, 300);
+    const ok = /logged.?in/i.test(result.stdout);
+    return {
+      ok,
+      detail: `${detail} · ${version.stdout.trim()}`,
+      recovery: ok ? undefined : "Run `/claude-review-status` for detailed diagnostics.",
+    };
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -1829,6 +1851,19 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
       },
     });
 
+    function checkClaudeReadinessOnSessionStart(ctx: ExtensionContext): void {
+      const sessionId = ctx.sessionManager.getSessionId();
+      void checkClaudeReadiness(pi, config)
+        .then((readiness) => {
+          if (ctx.sessionManager.getSessionId() !== sessionId || readiness.ok) return;
+          ctx.ui.notify(`Claude review will be unavailable: ${safeDisplay(readiness.detail, 300)} ${readiness.recovery ?? "Run `/claude-review-status` for detailed diagnostics."}`, "warning");
+        })
+        .catch((error) => {
+          if (ctx.sessionManager.getSessionId() !== sessionId) return;
+          ctx.ui.notify(`Claude review readiness check failed: ${safeDisplay(errorMessage(error), 300)} Run \`/claude-review-status\` for detailed diagnostics.`, "warning");
+        });
+    }
+
     pi.on("session_start", async (_event, ctx) => {
       loaded = loadConfigFile(configPath);
       config = loaded.config;
@@ -1860,6 +1895,7 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
         setStatus(ctx, "out of scope");
         return;
       }
+      checkClaudeReadinessOnSessionStart(ctx);
       await armTaskReview(task, ctx, "Could not initialize a Git baseline for this Pi session.");
     });
 
