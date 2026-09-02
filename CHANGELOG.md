@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-09-02)
 
 - Allow the reviewer process two turns. With a one-turn limit, medium and higher effort ended the turn without a verdict in a measurable share of runs, which surfaced as `no strict verdict` failures.
 - Change the default and example `effort` to `low`. Measured on a typical ticket bundle, `low` returned complete findings in 15–30 seconds with no turn-limit failures.

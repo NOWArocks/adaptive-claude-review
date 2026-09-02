@@ -77,10 +77,10 @@ claude auth status
 Install the tagged release:
 
 ```bash
-pi install git:github.com/NOWArocks/adaptive-claude-review@v0.2.0
+pi install git:github.com/NOWArocks/adaptive-claude-review@v0.3.0
 mkdir -p ~/.pi/agent
 test ! -e ~/.pi/agent/claude-review.json && \
-  curl -fsSL https://raw.githubusercontent.com/NOWArocks/adaptive-claude-review/v0.2.0/claude-review.example.json \
+  curl -fsSL https://raw.githubusercontent.com/NOWArocks/adaptive-claude-review/v0.3.0/claude-review.example.json \
   -o ~/.pi/agent/claude-review.json
 ```
 
