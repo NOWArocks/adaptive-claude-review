@@ -5,7 +5,7 @@
   ],
   "claudeCommand": "claude",
   "model": "opus",
-  "effort": "medium",
+  "effort": "low",
   "maxAutomaticReviewsPerTask": 3,
   "maxManualReviewsPerTask": 3,
   "maxSharedArtifactReviewsPerTask": 3,

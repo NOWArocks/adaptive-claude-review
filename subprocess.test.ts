@@ -24,8 +24,10 @@ process.stdin.on("end", () => {
   const cleanCwd = fs.readdirSync(process.cwd()).length === 0;
   const secretAbsent = process.env.AWS_SECRET_ACCESS_KEY === undefined;
   const effortIndex = process.argv.indexOf("--effort");
-  const mediumEffort = effortIndex >= 0 && process.argv[effortIndex + 1] === "medium";
-  if (!cleanCwd || !secretAbsent || !mediumEffort || !input.includes("review bundle")) process.exit(2);
+  const lowEffort = effortIndex >= 0 && process.argv[effortIndex + 1] === "low";
+  const turnsIndex = process.argv.indexOf("--max-turns");
+  const twoTurns = turnsIndex >= 0 && process.argv[turnsIndex + 1] === "2";
+  if (!cleanCwd || !secretAbsent || !lowEffort || !twoTurns || !input.includes("review bundle")) process.exit(2);
   process.stdout.write("VERDICT: PASS\\nIsolated reviewer process.");
 });
 `);

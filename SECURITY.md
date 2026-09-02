@@ -18,7 +18,7 @@ The reviewer process:
 
 - runs without a shell;
 - receives no tools;
-- uses one turn and no session persistence;
+- uses at most two turns and no session persistence;
 - starts in an empty temporary directory;
 - receives a minimal environment allowlist rather than all Pi process variables;
 - is checked for Claude CLI 2.1.226 or newer and authentication from a separate empty temporary directory;

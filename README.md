@@ -16,6 +16,7 @@ This is an independent project. It is not affiliated with or endorsed by Anthrop
 - Enforces one hard three-invocation cap across manual, automatic, shared-artifact, and direct Claude CLI reviews in each delivery cycle.
 - Stops repeated reviewer failures with a task-local circuit breaker.
 - Runs Claude without tools or session persistence, with a minimal environment and an empty temporary working directory.
+- Allows the reviewer process two turns so that a reasoning-heavy first turn can still deliver its verdict. The reviewer has no tools, so the second turn can only produce text.
 - Checks Claude CLI version and authentication asynchronously at each in-scope Pi session start. A missing or expired login produces a visible warning with the recovery command; a healthy check stays silent and never delays session startup.
 
 Shared-system review evaluates the current mutation, not an impossible atomic representation of a multi-step workflow. When `claude_review` receives an exact draft snapshot with matching `system`, `action`, `target`, and canonical JSON `content`, a `PASS` is cached for the Pi session. A later identical Jira or Confluence write reuses that review instead of calling Claude again. Changed or previously unreviewed payloads receive a pre-write review.
@@ -124,7 +125,7 @@ Malformed JSON produces a visible `config error` state and disables repository r
 | `allowedRoots` | Canonical directories in which review can run. | `[]` |
 | `claudeCommand` | Claude CLI executable. No shell is used. | `claude` |
 | `model` | Reviewer model. | `opus` |
-| `effort` | Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, or `max`. | `medium` |
+| `effort` | Claude reasoning effort: `low`, `medium`, `high`, `xhigh`, or `max`. `low` returns a verdict in 15–30 seconds on a typical bundle; higher effort roughly doubles that. | `low` |
 | `maxAutomaticReviewsPerTask` | Automatic delivery-gate sub-budget. It cannot exceed the hard three-review total. | `3` |
 | `maxManualReviewsPerTask` | Explicit tool-call sub-budget. It cannot exceed the hard three-review total. | `3` |
 | `maxSharedArtifactReviewsPerTask` | Jira and Confluence pre-write sub-budget. It cannot exceed the hard three-review total. | `3` |
