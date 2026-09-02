@@ -188,7 +188,7 @@ const DEFAULT_CONFIG: Config = {
   allowedRoots: [],
   claudeCommand: "claude",
   model: "opus",
-  effort: "medium",
+  effort: "low",
   maxAutomaticReviewsPerTask: 3,
   maxManualReviewsPerTask: 3,
   maxSharedArtifactReviewsPerTask: 3,
@@ -1178,7 +1178,7 @@ export async function runClaudeProcess(config: Config, input: string, signal?: A
   return new Promise<string>((resolvePromise, reject) => {
     const args = [
       "-p", "--output-format", "text", "--no-session-persistence", "--safe-mode",
-      "--model", config.model, "--effort", config.effort, "--permission-mode", "plan", "--max-turns", "1", "--tools", "",
+      "--model", config.model, "--effort", config.effort, "--permission-mode", "plan", "--max-turns", "2", "--tools", "",
       "--system-prompt", "You are a read-only second-pass reviewer. You have no tools. Never request or simulate tool calls. Use only the supplied bundle and return the required verdict directly.",
     ];
     const reviewCwd = mkdtempSync(join(tmpdir(), "pi-claude-review-"));
