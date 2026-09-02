@@ -8,7 +8,7 @@ Use this checklist for every public release.
 4. Run a static secret scan and inspect the package file list from `npm pack --dry-run --json`.
 5. Commit and push the release state while the repository is still private.
 6. Confirm that the GitHub Actions `Verify` workflow passes for the release commit.
-7. Create and push the annotated release tag.
+7. Create and push the annotated release tag. Then create the GitHub Release for that tag with the changelog section as its notes and mark it as the latest release: `gh release create vX.Y.Z --verify-tag --latest --title vX.Y.Z --notes-file <changelog-section>`. The repository sidebar shows Releases, not tags.
 8. Change the repository to public only after explicit approval from the owner.
 9. As the first action after the visibility change, enable GitHub private vulnerability reporting and verify the setting through the GitHub API.
 10. Confirm from a logged-out or non-member view that the reporting link in `SECURITY.md` is available.
