@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1420,5 +1420,179 @@ describe("configuration diagnostics", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Independent audit reproductions", () => {
+  test("invalidates a holistic shared-file review when a concurrent edit arrives during review", async () => {
+    let root = "";
+    await withHarness(async () => {
+      writeFileSync(join(root, "OPEN.md"), "# Open work\nConcurrent action\n");
+      return "VERDICT: PASS\nReviewed the earlier register.";
+    }, async (h) => {
+      root = h.root;
+      await h.start();
+      await h.mutate("OPEN.md", "# Open work\nTask action\n");
+      expect(warningText(await h.finish())).toContain("no Claude PASS");
+      await h.command("claude-review-last");
+      expect(h.notifications.at(-1)?.message).toContain("Status: unavailable");
+    }, "rpc", { sharedReviewPaths: ["OPEN.md"], reviewDocumentation: true });
+  });
+
+  test("invalidates a review when the user changes the task during the reviewer call", async () => {
+    let harness!: Harness;
+    await withHarness(async () => {
+      await harness.emit("input", { type: "input", source: "rpc", streamingBehavior: "steer", text: "Also preserve the old session behavior" });
+      return "VERDICT: PASS\nReviewed the original request.";
+    }, async (h) => {
+      harness = h;
+      await h.start();
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      expect(warningText(await h.finish())).toContain("no Claude PASS");
+    });
+  });
+
+  test("normalizes nested, parent-relative and symlinked reads before recording evidence", async () => {
+    let sent = "";
+    await withHarness(async (_config, input) => { sent = input; return "VERDICT: PASS\nReviewed."; }, async (h) => {
+      mkdirSync(join(h.root, "private"));
+      writeFileSync(join(h.root, "private/customer.json"), "{}");
+      symlinkSync(join(h.root, "private"), join(h.root, "alias"));
+      symlinkSync(join(h.root, "src/format.ts"), join(h.root, "private/public-alias.ts"));
+      await h.start();
+      for (const path of [join(h.root, "private/customer.json"), "alias/customer.json", "private/public-alias.ts", "src/../private/customer.json", "../outside.json"]) {
+        await h.emit("tool_result", { type: "tool_result", toolCallId: path, toolName: "read", input: { arguments: { path } }, isError: false, content: [] });
+      }
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "safe", toolName: "read", input: { path: join(h.root, "src/format.ts") }, isError: false, content: [] });
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      await h.finish();
+      expect(sent).not.toContain("customer.json");
+      expect(sent).not.toContain("public-alias.ts");
+      expect(sent).not.toContain("outside.json");
+      expect(sent).not.toContain(h.root);
+      expect(sent).toContain("File read: src/format.ts");
+    }, "rpc", { deniedPaths: ["private"] });
+  });
+
+  test("caches each shared findings context and keeps retries within the hard cap", async () => {
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: FINDINGS\nHigh: Unresolved source contradiction."; }, async (h) => {
+      await h.start();
+      const artifacts = [{ system: "Jira", target: "APP-1", content: "Proposed description" }];
+      const review = (rationale: string, unverified = ["First", "Second"]) => h.tools.get("claude_review").execute("review", { artifacts, rationale, unverified }, undefined, undefined, h.ctx);
+      await review("Context A");
+      await review("Context A", ["Second", "First", "First"]);
+      expect(calls).toBe(1);
+      await review("Context B");
+      await review("Context A");
+      expect(calls).toBe(2);
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "evidence", toolName: "getJiraIssue", input: { issueIdOrKey: "APP-1" }, isError: false, content: [] });
+      await review("Context A");
+      expect(calls).toBe(3);
+      await expect(review("Context C")).rejects.toThrow("hard limit of 3");
+      expect(calls).toBe(3);
+    });
+  });
+
+  test("reconsiders a blocked pre-write review after an authoritative source read", async () => {
+    let calls = 0;
+    await withHarness(async () => ++calls === 1 ? "VERDICT: FINDINGS\nHigh: Missing source support." : "VERDICT: PASS\nSource support now supplied.", async (h) => {
+      await h.start();
+      const event = { type: "tool_call", toolCallId: "write", toolName: "createJiraIssue", input: { projectKey: "APP", issueTypeName: "Task", summary: "Draft", description: "Scope" } };
+      expect((await h.emit("tool_call", event)).block).toBe(true);
+      expect((await h.emit("tool_call", event)).block).toBe(true);
+      expect(calls).toBe(1);
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "source", toolName: "getJiraIssue", input: { issueIdOrKey: "APP-1" }, isError: false, content: [] });
+      expect(await h.emit("tool_call", event)).toBeUndefined();
+      expect(calls).toBe(2);
+    }, "rpc", { sharedArtifactWriteMode: "enforce" });
+  });
+
+  test.each(["enforce", "advisory"])("preserves %s write policy after all three review slots are used", async (mode) => {
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nReviewed."; }, async (h) => {
+      await h.start();
+      for (let i = 0; i < 3; i++) {
+        await h.emit("tool_call", { type: "tool_call", toolCallId: `direct-${i}`, toolName: "bash", input: { command: "fake-claude -p review" } });
+      }
+      const event = { type: "tool_call", toolCallId: "write", toolName: "createJiraIssue", input: { projectKey: "APP", issueTypeName: "Task", summary: "Draft", description: "Scope" } };
+      const result = await h.emit("tool_call", event);
+      if (mode === "enforce") {
+        expect(result.block).toBe(true);
+        expect(result.reason).toContain("hard limit of 3");
+      } else {
+        expect(result).toBeUndefined();
+        const completed = await h.emit("tool_result", { ...event, type: "tool_result", isError: false, content: [] });
+        expect(completed.content.at(-1).text).toContain("no Claude PASS");
+      }
+      expect(calls).toBe(0);
+    }, "rpc", { sharedArtifactWriteMode: mode });
+  });
+
+  test("reuses an exact approved payload at the cap but blocks a changed assignment", async () => {
+    let calls = 0;
+    await withHarness(async () => { calls++; return "VERDICT: PASS\nDraft reviewed."; }, async (h) => {
+      await h.start();
+      const input = { cloudId: "site-one", projectKey: "APP", issueTypeName: "Task", summary: "Draft", assignee_account_id: "alice" };
+      const artifact = sharedArtifactFromToolCall("createJiraIssue", input)!;
+      await h.tools.get("claude_review").execute("draft", { rationale: "Review exact draft", artifacts: [artifact] }, undefined, undefined, h.ctx);
+      for (let i = 0; i < 2; i++) await h.emit("tool_call", { type: "tool_call", toolCallId: `direct-${i}`, toolName: "bash", input: { command: "fake-claude -p review" } });
+      const event = { type: "tool_call", toolCallId: "changed", toolName: "createJiraIssue", input: { ...input, assignee_account_id: "bob" } };
+      expect((await h.emit("tool_call", event)).block).toBe(true);
+      expect(await h.emit("tool_call", { ...event, toolCallId: "exact", input })).toBeUndefined();
+      expect(calls).toBe(1);
+    }, "rpc", { sharedArtifactWriteMode: "enforce" });
+  });
+
+  test("does not release a PASS after a file changes while the reviewer runs", async () => {
+    let root = "";
+    await withHarness(async () => {
+      writeFileSync(join(root, "src/auth/session.ts"), "export const secure = false;\n// Concurrent change\n");
+      return "VERDICT: PASS\nReviewed original state.";
+    }, async (h) => {
+      root = h.root;
+      await h.start();
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      const delivery = await h.finish();
+      expect(warningText(delivery)).toContain("no Claude PASS");
+    });
+  });
+
+  test("withholds denied path metadata when read uses an absolute path", async () => {
+    let sent = "";
+    await withHarness(async (_config, input) => {
+      sent = input;
+      return "VERDICT: PASS\nReviewed.";
+    }, async (h) => {
+      await h.start();
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "private-read", toolName: "read", input: { path: join(h.root, "private/customer.json") }, isError: false, content: [] });
+      await h.mutate("src/auth/session.ts", "export const secure = true;\n");
+      await h.finish();
+      expect(sent.includes("private/customer.json")).toBe(false);
+    }, "rpc", { deniedPaths: ["private"] });
+  });
+
+  test("reconsiders shared artifact findings when new evidence and rationale arrive", async () => {
+    let calls = 0;
+    await withHarness(async () => {
+      calls++;
+      return calls === 1 ? "VERDICT: FINDINGS\nHigh: The scope is not supported by source evidence." : "VERDICT: PASS\nNew evidence supports the scope.";
+    }, async (h) => {
+      await h.start();
+      const artifacts = [{ system: "Jira", action: "create issue", target: "WKW: Survey", content: JSON.stringify({ projectKey: "WKW", issueTypeName: "Task", summary: "Survey", description: "Acceptance criteria" }) }];
+      const tool = h.tools.get("claude_review");
+      await tool.execute("first", { rationale: "Review draft", artifacts }, undefined, undefined, h.ctx);
+      await h.emit("tool_result", { type: "tool_result", toolCallId: "source-read", toolName: "mcp_http_atlassian_getjiraissue", input: { issueIdOrKey: "WKW-123" }, isError: false, content: [] });
+      const second = await tool.execute("second", { rationale: "The source issue now confirms the exact scope", artifacts }, undefined, undefined, h.ctx);
+      expect(calls).toBe(2);
+      expect(second.details.passed).toBe(true);
+    }, "rpc", { sharedArtifactWriteMode: "enforce" });
+  });
+
+  test("different Jira cloud targets do not share an artifact fingerprint", () => {
+    const fields = { issueIdOrKey: "APP-1", fields: { summary: "Reviewed title" } };
+    const a = sharedArtifactFromToolCall("editJiraIssue", { ...fields, cloudId: "tenant-one" })!;
+    const b = sharedArtifactFromToolCall("editJiraIssue", { ...fields, cloudId: "tenant-two" })!;
+    expect(a.fingerprint).not.toBe(b.fingerprint);
   });
 });

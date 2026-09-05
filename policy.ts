@@ -447,6 +447,7 @@ export function observeToolEvidence(
   input: Record<string, unknown>,
   isError: boolean,
   deniedPaths: string[] = [],
+  normalizeReadPath: (path: string) => string | undefined = (path) => path,
 ): ToolEvidenceObservation {
   if (toolName === "bash") {
     const rawCommand = firstString(input, ["command"]) ?? "";
@@ -462,7 +463,8 @@ export function observeToolEvidence(
   if (isError) return {};
 
   if (toolName === "read") {
-    const path = firstString(input, ["path"]);
+    const rawPath = firstString(input, ["path"]);
+    const path = rawPath ? normalizeReadPath(rawPath) : undefined;
     if (!path || isProtectedReviewPath(path, deniedPaths)) return {};
     const safePath = evidenceDetail(path, "file path");
     return IMAGE_PATH.test(path)

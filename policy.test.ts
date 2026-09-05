@@ -61,6 +61,31 @@ const added = (path: string, addedLines: number) => ({
 });
 
 describe("sharedArtifactFromToolCall", () => {
+  test.each([
+    ["createJiraIssue", { projectKey: "APP", issueTypeName: "Task", summary: "Example" }, "assignee_account_id"],
+    ["editJiraIssue", { issueIdOrKey: "APP-1", fields: { summary: "Example" } }, "cloudId"],
+    ["addCommentToJiraIssue", { issueIdOrKey: "APP-1", commentBody: "Example" }, "cloudId"],
+    ["createConfluencePage", { spaceId: "123", title: "Example", body: "Example" }, "cloudId"],
+    ["updateConfluencePage", { pageId: "123", body: "Example" }, "spaceId"],
+    ["updateConfluencePage", { pageId: "123", body: "Example" }, "versionMessage"],
+    ["createConfluenceInlineComment", { pageId: "123", body: "Example" }, "inlineCommentProperties"],
+    ["updateConfluenceInlineComment", { commentId: "456", body: "Example" }, "cloudId"],
+  ] as const)("includes %s routing and mutation field %s in the reviewed payload", (tool, values, field) => {
+    const first = sharedArtifactFromToolCall(tool, { ...values, [field]: "first" })!;
+    const second = sharedArtifactFromToolCall(tool, { ...values, [field]: "second" })!;
+    expect(JSON.parse(first.content)[field]).toBe("first");
+    expect(first.fingerprint).not.toBe(second.fingerprint);
+  });
+
+  test("preserves the cloud destination through nested tool envelopes", () => {
+    const fields = { projectKey: "APP", issueTypeName: "Task", summary: "Example" };
+    const nested = sharedArtifactFromToolCall("createJiraIssue", { cloudId: "one", arguments: { arguments: fields } })!;
+    const flat = sharedArtifactFromToolCall("createJiraIssue", { ...fields, cloudId: "one" })!;
+    const other = sharedArtifactFromToolCall("createJiraIssue", { cloudId: "two", arguments: fields })!;
+    expect(nested.fingerprint).toBe(flat.fingerprint);
+    expect(nested.fingerprint).not.toBe(other.fingerprint);
+  });
+
   test("extracts nested Jira issue creation content", () => {
     const artifact = sharedArtifactFromToolCall("mcp_http_atlassian_createjiraissue", {
       arguments: {

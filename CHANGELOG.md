@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 (2026-09-05)
+
+- Recheck repository state and task context after review so concurrent changes cannot receive a stale PASS.
+- Normalize read paths before evidence filtering, including absolute paths, parent-relative paths, and symlink targets. Withhold denied and outside-repository path metadata.
+- Fingerprint complete shared-write arguments, including cloud destination, Jira assignment, Confluence space, and comment location fields.
+- Allow shared-artifact findings to be reconsidered after new evidence, rationale, or declared unknowns. Cache repeated contexts without spending another review slot.
+- Keep enforcing shared-system writes blocked when the three-review budget is exhausted. Exact cached PASS reuse remains available; advisory mode retains its visible no-PASS warning.
+
 ## 0.3.0 (2026-09-02)
 
 - Allow the reviewer process two turns. With a one-turn limit, medium and higher effort ended the turn without a verdict in a measurable share of runs, which surfaced as `no strict verdict` failures.

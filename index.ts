@@ -166,7 +166,7 @@ type TaskState = {
   pathRisks: Map<string, PathRisk>;
   reviewedResults: Map<string, ReviewResult>;
   reviewedRequestContexts: Set<string>;
-  reviewedSharedArtifacts: Map<string, SharedArtifactReviewResult>;
+  reviewedSharedArtifacts: Map<string, Map<string, SharedArtifactReviewResult>>;
   approvedSharedArtifacts: SharedArtifactCandidate[];
   timedOutFingerprints: Set<string>;
   feedbackQueuedReviewContexts: Set<string>;
@@ -636,13 +636,18 @@ function formatDecision(decision: ReturnType<typeof classifyReview>): string {
 
 function unwrapToolInput(input: unknown): Record<string, unknown> {
   let current = input;
+  let cloudId: unknown;
   for (let depth = 0; depth < 6; depth++) {
     if (!current || typeof current !== "object" || Array.isArray(current)) return {};
     const values = current as Record<string, unknown>;
-    if (!values.arguments || typeof values.arguments !== "object" || Array.isArray(values.arguments)) return values;
+    if (values.cloudId !== undefined) cloudId = values.cloudId;
+    if (!values.arguments || typeof values.arguments !== "object" || Array.isArray(values.arguments)) {
+      return cloudId === undefined ? values : { ...values, cloudId };
+    }
     current = values.arguments;
   }
-  return current && typeof current === "object" && !Array.isArray(current) ? current as Record<string, unknown> : {};
+  if (!current || typeof current !== "object" || Array.isArray(current)) return {};
+  return cloudId === undefined ? current as Record<string, unknown> : { ...current, cloudId };
 }
 
 function canonicalArtifactContent(content: string): string {
@@ -702,14 +707,7 @@ export function sharedArtifactFromToolCall(toolName: string, input: unknown): Sh
   if (/createjiraissue/.test(name)) {
     const summary = typeof values.summary === "string" ? values.summary : "untitled issue";
     const project = typeof values.projectKey === "string" ? values.projectKey : "unknown project";
-    return artifactCandidate("Jira", "create issue", `${project}: ${summary}`, {
-      projectKey: values.projectKey,
-      issueTypeName: values.issueTypeName,
-      summary: values.summary,
-      description: values.description,
-      parent: values.parent,
-      additional_fields: values.additional_fields,
-    });
+    return artifactCandidate("Jira", "create issue", `${project}: ${summary}`, values);
   }
 
   if (/editjiraissue/.test(name)) {
@@ -722,32 +720,19 @@ export function sharedArtifactFromToolCall(toolName: string, input: unknown): Sh
     const metadataFields = new Set(["assignee", "components", "duedate", "fixVersions", "labels", "priority", "resolution", "status"]);
     if (!hasUpdate && Object.keys(productFields).every((key) => metadataFields.has(key))) return undefined;
     const target = typeof values.issueIdOrKey === "string" ? values.issueIdOrKey.toUpperCase() : "unknown issue";
-    return artifactCandidate("Jira", "edit issue", target, { issueIdOrKey: values.issueIdOrKey, fields: hasFields ? productFields : undefined, update: hasUpdate ? update : undefined });
+    return artifactCandidate("Jira", "edit issue", target, values);
   }
 
   if (/addcommenttojiraissue/.test(name)) {
     if (typeof values.commentBody !== "string" || !values.commentBody.trim()) return undefined;
     const target = typeof values.issueIdOrKey === "string" ? values.issueIdOrKey.toUpperCase() : "unknown issue";
-    return artifactCandidate("Jira", values.commentId ? "edit comment" : "add comment", target, {
-      issueIdOrKey: values.issueIdOrKey,
-      commentBody: values.commentBody,
-      commentVisibility: values.commentVisibility,
-      commentId: values.commentId,
-    });
+    return artifactCandidate("Jira", values.commentId ? "edit comment" : "add comment", target, values);
   }
 
   if (/createconfluencepage/.test(name)) {
     const title = typeof values.title === "string" ? values.title : "untitled page";
     const space = typeof values.spaceId === "string" ? values.spaceId : "unknown space";
-    return artifactCandidate("Confluence", "create page", `${space}: ${title}`, {
-      spaceId: values.spaceId,
-      contentType: values.contentType,
-      title: values.title,
-      status: values.status,
-      parentId: values.parentId,
-      body: values.body,
-      contentFormat: values.contentFormat,
-    });
+    return artifactCandidate("Confluence", "create page", `${space}: ${title}`, values);
   }
 
   if (/updateconfluencepage/.test(name)) {
@@ -755,25 +740,13 @@ export function sharedArtifactFromToolCall(toolName: string, input: unknown): Sh
     const changesPublicationState = ["status", "title", "parentId", "spaceId"].some((key) => key in values);
     if (!hasBody && !changesPublicationState) return undefined;
     const target = typeof values.pageId === "string" ? values.pageId : "unknown page";
-    return artifactCandidate("Confluence", "update page", target, {
-      pageId: values.pageId,
-      title: values.title,
-      status: values.status,
-      parentId: values.parentId,
-      body: values.body,
-      contentFormat: values.contentFormat,
-    });
+    return artifactCandidate("Confluence", "update page", target, values);
   }
 
   if (/createconfluence.*comment/.test(name)) {
     if (typeof values.body !== "string" || !values.body.trim()) return undefined;
     const target = typeof values.pageId === "string" ? values.pageId : "unknown page";
-    return artifactCandidate("Confluence", "add comment", target, {
-      pageId: values.pageId,
-      parentCommentId: values.parentCommentId,
-      body: values.body,
-      contentFormat: values.contentFormat,
-    });
+    return artifactCandidate("Confluence", "add comment", target, values);
   }
 
   if (/(?:update|edit)confluence.*comment/.test(name)) {
@@ -781,12 +754,7 @@ export function sharedArtifactFromToolCall(toolName: string, input: unknown): Sh
     let target = "unknown comment";
     if (typeof values.commentId === "string") target = values.commentId;
     else if (typeof values.pageId === "string") target = values.pageId;
-    return artifactCandidate("Confluence", "edit comment", target, {
-      pageId: values.pageId,
-      commentId: values.commentId,
-      body: values.body,
-      contentFormat: values.contentFormat,
-    });
+    return artifactCandidate("Confluence", "edit comment", target, values);
   }
 
   return undefined;
@@ -1671,6 +1639,12 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
         invalidateAuthentication = true;
         const output = await reviewer(config, input, options.signal);
         assertOwner(owner, ctx);
+        const current = await prepareReview(owner, ctx, undefined, true, options.signal);
+        assertOwner(owner, ctx);
+        if (!current || current.fingerprint !== prepared.fingerprint
+          || taskReviewContextFingerprint(captureReviewContext(owner)) !== taskContextFingerprint) {
+          throw new Error("The file state or task context changed while Claude review was running. The returned verdict does not cover the current delivery.");
+        }
         if (containsLikelySecret(output)) throw new ReviewBundleSafetyError("Claude reviewer output was withheld because it appears to contain a credential.");
         const verdict = parseReviewVerdict(output);
         if (verdict === "unknown") throw new Error(`Claude reviewer returned no strict verdict: ${safeDisplay(output)}`);
@@ -1714,7 +1688,19 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
       if (paused) throw new Error("Adaptive Claude review is paused for this Pi session.");
       if (!isAllowedProject(ctx.cwd, config)) throw new Error("This project is outside the configured allowedRoots.");
       if (owner.reviewInFlight) throw new Error("A Claude review is already running.");
-      const existing = owner.reviewedSharedArtifacts.get(artifact.fingerprint);
+      const context: ReviewContextSnapshot = {
+        taskPrompt: owner.prompt,
+        evidenceSources: sessionEvidence.sources(),
+        evidenceChecks: sessionEvidence.checks(),
+        evidenceObservations: sessionEvidence.observed(),
+      };
+      const priorArtifacts = [...owner.approvedSharedArtifacts];
+      const contextKey = reviewContextFingerprint({
+        request: requestReviewContextFingerprint(context, rationale, unverified),
+        priorArtifacts: priorArtifacts.map((prior) => prior.fingerprint),
+      });
+      const previous = owner.reviewedSharedArtifacts.get(artifact.fingerprint);
+      const existing = [...(previous?.values() ?? [])].find((result) => result.verdict === "pass") ?? previous?.get(contextKey);
       if (existing) return existing;
       if (owner.totalReviewAttempts >= MAX_REVIEWS_PER_DELIVERY) throw reviewCapError();
       const limit = source === "manual" ? config.maxManualReviewsPerTask : config.maxSharedArtifactReviewsPerTask;
@@ -1742,12 +1728,12 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
         }
         const input = buildSharedArtifactReviewInput(
           artifact,
-          owner.approvedSharedArtifacts,
-          owner.prompt,
+          priorArtifacts,
+          context.taskPrompt,
           config.reviewPriorities,
-          sessionEvidence.sources(),
-          sessionEvidence.checks(),
-          sessionEvidence.observed(),
+          context.evidenceSources,
+          context.evidenceChecks,
+          context.evidenceObservations,
           rationale,
           unverified,
         );
@@ -1772,7 +1758,9 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
           severities,
           fingerprint: artifact.fingerprint,
         };
-        owner.reviewedSharedArtifacts.set(artifact.fingerprint, result);
+        const reviews = owner.reviewedSharedArtifacts.get(artifact.fingerprint) ?? new Map<string, SharedArtifactReviewResult>();
+        reviews.set(contextKey, result);
+        owner.reviewedSharedArtifacts.set(artifact.fingerprint, reviews);
         owner.consecutiveFailures = 0;
         setLast(owner, verdict === "pass" ? "passed" : "findings", [`${artifact.system}:${artifact.target}`], [`pre-write ${artifact.action} review`], startedAt, verdict === "findings" ? output : undefined, undefined, true, input.length);
         return result;
@@ -1947,7 +1935,7 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
           const detail = safeDisplay(errorMessage(error), 1_000);
           const sharedWriteMode = loaded.error ? "enforce" : config.sharedArtifactWriteMode;
           if (error instanceof ReviewBundleSafetyError || error instanceof ReviewOwnershipError || isReviewBundleCancellation(error) || ctx.signal?.aborted
-            || (sharedWriteMode === "enforce" && !(error instanceof ReviewCapReachedError))) {
+            || sharedWriteMode === "enforce") {
             return {
               block: true,
               reason: error instanceof ReviewBundleSafetyError
@@ -2050,7 +2038,13 @@ export function createAdaptiveClaudeReview(options: AdaptiveClaudeReviewOptions 
       }
 
       if (!config.enabled) return;
-      const observation = observeToolEvidence(event.toolName, event.input, event.isError, config.deniedPaths);
+      const observation = observeToolEvidence(event.toolName, event.input, event.isError, config.deniedPaths, (path) => {
+        const root = owner.baseline?.root ?? ctx.cwd;
+        const cwdFromRoot = relative(canonicalPath(root), canonicalPath(ctx.cwd));
+        const requestedPath = normalizeReviewScopePath(join(cwdFromRoot, relative(ctx.cwd, resolve(ctx.cwd, path))));
+        if (requestedPath && isProtectedReviewPath(requestedPath, config.deniedPaths)) return undefined;
+        return taskRelativePath(root, ctx.cwd, path);
+      });
       owner.evidence.record(observation.source, observation.check);
       sessionEvidence.record(observation.source, observation.check);
 

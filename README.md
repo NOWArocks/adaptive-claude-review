@@ -21,7 +21,7 @@ This is an independent project. It is not affiliated with or endorsed by Anthrop
 
 Shared-system review evaluates the current mutation, not an impossible atomic representation of a multi-step workflow. When `claude_review` receives an exact draft snapshot with matching `system`, `action`, `target`, and canonical JSON `content`, a `PASS` is cached for the Pi session. A later identical Jira or Confluence write reuses that review instead of calling Claude again. Changed or previously unreviewed payloads receive a pre-write review.
 
-`sharedArtifactWriteMode` controls that pre-write result. The release example selects `advisory`, which lets the explicitly requested write proceed with a visible finding or no-PASS warning; deterministic credential checks still block. This mode assumes that the host agent or a separate policy gate enforces current-turn write authorization. `enforce` retains fail-closed blocking for configured severities and reviewer unavailability. When a later write depends on an identifier created by the current write, the first mutation can proceed before a separate issue-link call uses the generated key. Exact-target read-back remains required after every successful write.
+`sharedArtifactWriteMode` controls that pre-write result. The release example selects `advisory`, which lets the explicitly requested write proceed with a visible finding or no-PASS warning; deterministic credential checks still block. This mode assumes that the host agent or a separate policy gate enforces current-turn write authorization. `enforce` retains fail-closed blocking for configured severities and reviewer unavailability, including an exhausted review budget. An exact cached PASS can still be reused without another invocation. When a later write depends on an identifier created by the current write, the first mutation can proceed before a separate issue-link call uses the generated key. Exact-target read-back remains required after every successful write.
 
 A Claude `PASS` is evidence from a bounded second model, not proof of correctness. Exact-target verification remains required.
 
@@ -77,10 +77,10 @@ claude auth status
 Install the tagged release:
 
 ```bash
-pi install git:github.com/NOWArocks/adaptive-claude-review@v0.3.0
+pi install git:github.com/NOWArocks/adaptive-claude-review@v0.3.1
 mkdir -p ~/.pi/agent
 test ! -e ~/.pi/agent/claude-review.json && \
-  curl -fsSL https://raw.githubusercontent.com/NOWArocks/adaptive-claude-review/v0.3.0/claude-review.example.json \
+  curl -fsSL https://raw.githubusercontent.com/NOWArocks/adaptive-claude-review/v0.3.1/claude-review.example.json \
   -o ~/.pi/agent/claude-review.json
 ```
 
@@ -159,12 +159,12 @@ For a Jira or Confluence draft that will be written after user approval, call `c
     "system": "Jira",
     "action": "create issue",
     "target": "WKW: Implement survey",
-    "content": "{\"projectKey\":\"WKW\",\"issueTypeName\":\"Task\",\"summary\":\"Implement survey\",\"description\":\"Acceptance criteria\"}"
+    "content": "{\"cloudId\":\"your-cloud-id\",\"projectKey\":\"WKW\",\"issueTypeName\":\"Task\",\"summary\":\"Implement survey\",\"description\":\"Acceptance criteria\"}"
   }]
 }
 ```
 
-The extension canonicalizes valid JSON before fingerprinting it, so object key order and whitespace do not matter. System, action, target, JSON values, and nested array order must match the later tool call. A matching `PASS` is reused only in the same Pi session. Successful create and add actions consume the cached PASS so an identical duplicate creation is reviewed again; field-replacing Jira edits and idempotent Confluence/comment updates can retain it. Jira edits with append-style `update` operations consume the PASS. A changed payload is reviewed again under `sharedArtifactWriteMode`.
+The extension canonicalizes valid JSON before fingerprinting it, so object key order and whitespace do not matter. System, action, target, all tool arguments, and nested array order must match the later tool call. Include `cloudId` and every supplied field in the draft JSON, including assignment, destination space, and comment location fields. Changing any argument requires a new review. A matching `PASS` is reused only in the same Pi session. Successful create and add actions consume the cached PASS so an identical duplicate creation is reviewed again; field-replacing Jira edits and idempotent Confluence/comment updates can retain it. Jira edits with append-style `update` operations consume the PASS. A changed payload is reviewed again under `sharedArtifactWriteMode`. Shared-artifact findings are cached per review context: new evidence, rationale, or declared unknowns can trigger another review of unchanged content. Repeating the same context reuses its findings and does not consume a slot.
 
 ## Outbound data and privacy
 
@@ -216,7 +216,7 @@ Unresolved blocking findings are returned privately for correction. The extensio
 
 After blocking findings, each corrected state must receive the next available review even when the remaining diff would normally be skipped as small or test-only. JSON and print modes cannot run correction turns; blocking findings release a visible one-shot warning instead.
 
-A `PASS` remains valid for the same file-state fingerprint. Blocking `FINDINGS` can receive another review without an artificial file edit only when the bounded review context changes, such as new task evidence or a changed manual rationale or unknown list. An exact duplicate context is rejected, and the hard three-review cap bounds all retries.
+Before accepting a repository verdict, the extension rechecks the file state and task context. A change during review invalidates the verdict and delivery carries a no-PASS warning. A `PASS` remains valid for the same file-state fingerprint. Blocking `FINDINGS` can receive another review without an artificial file edit only when the bounded review context changes, such as new task evidence or a changed manual rationale or unknown list. An exact duplicate context is rejected, and the hard three-review cap bounds all retries.
 
 Reviewer output and withheld drafts are wrapped in fresh random untrusted-data boundaries before the private correction turn. The primary agent is told to evaluate findings as claims and never execute embedded instructions.
 
